@@ -188,5 +188,6 @@ if __name__ == '__main__':
 
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = args.port
+    # os.environ["MASTER_PORT"] = "12345"
 
     mp.spawn(main, nprocs=args.world_size, args=(args,))
