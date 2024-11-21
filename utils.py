@@ -32,7 +32,7 @@ from pocket.utils import DetectionAPMeter, BoxPairAssociation
 
 from ops import recover_boxes
 from detr.datasets import transforms as T
-
+import ModifiedCLIP as clip
 def custom_collate(batch):
     images = []
     targets = []
@@ -40,6 +40,89 @@ def custom_collate(batch):
         images.append(im)
         targets.append(tar)
     return images, targets
+
+class DataFactory_CLIP(Dataset):
+    def __init__(self, name, partition, data_root, args):
+        if name not in ['hicodet', 'vcoco']:
+            raise ValueError("Unknown dataset ", name)
+
+        if name == 'hicodet':
+            assert partition in ['train2015', 'test2015'], \
+                "Unknown HICO-DET partition " + partition
+            self.dataset = HICODet(
+                root=os.path.join(data_root, "hico_20160224_det/images", partition),
+                anno_file=os.path.join(data_root, f"instances_{partition}.json"),
+                target_transform=pocket.ops.ToTensor(input_format='dict')
+            )
+        else:
+            assert partition in ['train', 'val', 'trainval', 'test'], \
+                "Unknown V-COCO partition " + partition
+            image_dir = dict(
+                train='mscoco2014/train2014',
+                val='mscoco2014/train2014',
+                trainval='mscoco2014/train2014',
+                test='mscoco2014/val2014'
+            )
+            self.dataset = VCOCO(
+                root=os.path.join(data_root, image_dir[partition]),
+                anno_file=os.path.join(data_root, f"instances_vcoco_{partition}.json"),
+                target_transform=pocket.ops.ToTensor(input_format='dict')
+            )
+
+        # Prepare dataset transforms
+        normalize = T.Compose([
+            T.ToTensor(),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+        scales = [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
+        if partition.startswith('train'):
+            self.transforms = [T.Compose([
+                T.RandomHorizontalFlip(),
+                T.ColorJitter(.4, .4, .4),
+                T.RandomSelect(
+                    T.RandomResize(scales, max_size=1333),
+                    T.Compose([
+                        T.RandomResize([400, 500, 600]),
+                        T.RandomSizeCrop(384, 600),
+                        T.RandomResize(scales, max_size=1333),
+                    ]))]
+                ),
+                normalize
+                ]
+        else:
+            self.transforms = [T.Compose([
+                T.RandomResize([800], max_size=1333),
+            ]),
+                normalize
+            ]
+
+        self.name = name
+
+        self.clip_preprocess = args.clip_preprocess
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, i):
+        image, target = self.dataset[i]
+        # print("image: ", image)
+        # print("target: ", target)
+        if self.name == 'hicodet':
+            target['labels'] = target['verb']
+            # Convert ground truth boxes to zero-based index and the
+            # representation from pixel indices to coordinates
+            target['boxes_h'][:, :2] -= 1
+            target['boxes_o'][:, :2] -= 1
+        else:
+            target['labels'] = target['actions']
+            target['object'] = target.pop('objects')
+        image_0, target_0 = self.transforms[0](image, target)
+        image, target = self.transforms[1](image_0, target_0)
+        clip_inputs = self.clip_preprocess(image_0)
+        target['clip_inputs'] = clip_inputs
+        # print("image out shape: ", image.shape)
+        # print("clip_inputs shape: ", clip_inputs.shape)
+        return image, target
 
 class DataFactory(Dataset):
     def __init__(self, name, partition, data_root):
@@ -101,6 +184,8 @@ class DataFactory(Dataset):
 
     def __getitem__(self, i):
         image, target = self.dataset[i]
+        # print("image: ", image)
+        # print("target: ", target)
         if self.name == 'hicodet':
             target['labels'] = target['verb']
             # Convert ground truth boxes to zero-based index and the
@@ -291,8 +376,17 @@ class CustomisedDLE(DistributedLearningEngine):
                 num_gt=dataset.anno_interaction,
             )
         for batch in tqdm(dataloader, disable=(self._world_size != 1)):
+            # print("batch[:-1]: ", batch[:-1])
+            # print("batch[-1]: ", batch[-1])
+            # if self.config.CLIP:
+            #     inputs = pocket.ops.relocate_to_cuda(batch)
+            # else:
             inputs = pocket.ops.relocate_to_cuda(batch[:-1])
-            outputs = net(*inputs)
+            # print("inputs: ", inputs)
+            if self.config.CLIP:
+                outputs = net(*inputs, batch[-1])
+            else:
+                outputs = net(*inputs)
             outputs = pocket.ops.relocate_to_cpu(outputs, ignore=True)
             targets = batch[-1]
 

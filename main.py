@@ -20,8 +20,9 @@ import torch.multiprocessing as mp
 from torch.utils.data import DataLoader, DistributedSampler
 
 from pvic import build_detector
-from utils import custom_collate, CustomisedDLE, DataFactory
+from utils import custom_collate, CustomisedDLE, DataFactory, DataFactory_CLIP
 from configs import base_detector_args, advanced_detector_args
+import ModifiedCLIP as clip
 
 warnings.filterwarnings("ignore")
 
@@ -41,15 +42,29 @@ def main(rank, args):
     random.seed(seed)
 
     torch.cuda.set_device(rank)
-
-    trainset = DataFactory(
-        name=args.dataset, partition=args.partitions[0],
-        data_root=args.data_root
-    )
-    testset = DataFactory(
-        name=args.dataset, partition=args.partitions[1],
-        data_root=args.data_root
-    )
+    if args.CLIP:
+        device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+        args.clip_model, args.clip_preprocess = clip.load(args.CLIP_path, device=device)
+        for param in args.clip_model.parameters():
+            param.requires_grad = False
+        args.clip_model.eval()
+        trainset = DataFactory_CLIP(
+            name=args.dataset, partition=args.partitions[0],
+            data_root=args.data_root, args=args
+        )
+        testset = DataFactory_CLIP(
+            name=args.dataset, partition=args.partitions[1],
+            data_root=args.data_root, args=args
+        )
+    else:
+        trainset = DataFactory(
+            name=args.dataset, partition=args.partitions[0],
+            data_root=args.data_root
+        )
+        testset = DataFactory(
+            name=args.dataset, partition=args.partitions[1],
+            data_root=args.data_root
+        )
 
     train_loader = DataLoader(
         dataset=trainset,
@@ -80,7 +95,7 @@ def main(rank, args):
     if os.path.exists(args.resume):
         print(f"=> Rank {rank}: PViC loaded from saved checkpoint {args.resume}.")
         checkpoint = torch.load(args.resume, map_location='cpu')
-        model.load_state_dict(checkpoint['model_state_dict'])
+        model.load_state_dict(checkpoint['model_state_dict'], strict=False) # modified for load of clip
     else:
         print(f"=> Rank {rank}: PViC randomly initialised.")
 
@@ -138,7 +153,7 @@ def sanity_check(args):
     if os.path.exists(args.resume):
         ckpt = torch.load(args.resume, map_location='cpu')
         print(f"Loading checkpoints from {args.resume}.")
-        model.load_state_dict(ckpt['model_state_dict'])
+        model.load_state_dict(ckpt['model_state_dict'], strict=False) # modified for load of clip
 
     image, target = dataset[998]
     outputs = model([image], targets=[target])
@@ -156,6 +171,8 @@ if __name__ == '__main__':
         parser.add_argument('--detector', default='advanced', type=str)
         parser.add_argument('--raw-lambda', default=1.7, type=float)
 
+    parser.add_argument('--CLIP', action='store_true', help='use CLIP feature')
+    parser.add_argument('--CLIP_path', type=str)
     parser.add_argument('--kv-src', default='C5', type=str, choices=['C5', 'C4', 'C3'])
     parser.add_argument('--repr-dim', default=384, type=int)
     parser.add_argument('--triplet-enc-layers', default=1, type=int)

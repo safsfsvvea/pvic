@@ -83,6 +83,166 @@ class TransformerEncoder(nn.Module):
             attn_weights.append(attn)
         return x, attn_weights
 
+class TransformerDecoderLayerCLIP(nn.Module):
+
+    def __init__(self, q_dim, kv_dim, num_heads, ffn_interm_dim, dropout=0.1):
+        """
+        Parameters:
+        -----------
+        q_dim: int
+            Dimension of the interaction queries.
+        kv_dim: int
+            Dimension of the image features.
+        num_heads: int
+            Number of heads used in multihead attention.
+        ffn_interm_dim: int
+            Dimension of the intermediate representation in the feedforward network.
+        dropout: float, default: 0.1
+            Dropout percentage used during training.
+        """
+        super().__init__()
+        self.q_dim = q_dim
+        self.kv_dim = kv_dim
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.ffn_interm_dim = ffn_interm_dim
+
+        # Linear projections on qkv have been removed in this custom layer.
+        self.q_attn = MultiheadAttention(q_dim, num_heads, dropout=dropout)
+        # Add the missing linear projections.
+        self.q_attn_q_proj = nn.Linear(q_dim, q_dim)
+        self.q_attn_k_proj = nn.Linear(q_dim, q_dim)
+        self.q_attn_v_proj = nn.Linear(q_dim, q_dim)
+        # Each scalar is mapped to a vector of shape kv_dim // 2.
+        # For a box pair, the dimension is 8 * (kv_dim // 2).
+        self.q_attn_qpos_proj = nn.Linear(kv_dim * 4, q_dim)
+        self.q_attn_kpos_proj = nn.Linear(kv_dim * 4, q_dim)
+
+        self.qk_attn = MultiheadAttention(q_dim * 2, num_heads, dropout=dropout, vdim=q_dim)
+        self.qk_attn_q_proj = nn.Linear(q_dim, q_dim)
+        self.qk_attn_k_proj = nn.Linear(kv_dim, q_dim)
+        self.qk_attn_v_proj = nn.Linear(kv_dim, q_dim)
+        self.qk_attn_kpos_proj = nn.Linear(kv_dim, q_dim)
+        self.qk_attn_qpos_proj = nn.Linear(kv_dim * 2, q_dim)
+
+        self.ffn = nn.Sequential(
+            nn.Linear(q_dim, ffn_interm_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_interm_dim, q_dim)
+        )
+        self.ln1 = nn.LayerNorm(q_dim)
+        self.ln2 = nn.LayerNorm(q_dim)
+        self.ln3 = nn.LayerNorm(q_dim)
+        self.dp1 = nn.Dropout(dropout)
+        self.dp2 = nn.Dropout(dropout)
+        self.dp3 = nn.Dropout(dropout)
+
+    def forward(self,
+            queries: Tensor, features: Tensor, clip_features: Tensor,
+            q_pos: Tensor, k_pos: Tensor, k_pos_clip: Tensor,
+            q_attn_mask: Optional[Tensor] = None,
+            qk_attn_mask: Optional[Tensor] = None,
+            q_padding_mask: Optional[Tensor] = None,
+            kv_padding_mask: Optional[Tensor] = None,
+            kv_padding_mask_clip: Optional[Tensor] = None,
+        ):
+        """
+        Parameters:
+        -----------
+        queries: Tensor
+            Interaction queries of size (N, B, K).
+        features: Tensor
+            Image features of size (HW, B, C).
+        clip_features: Tensor
+            CLIP Image features of size (HW, B, C).
+        q_attn_mask: Tensor, default: None
+            Attention mask to be applied during the self attention of queries.
+        qk_attn_mask: Tensor, default: None
+            Attention mask to be applied during the cross attention from image
+            features to interaction queries.
+        q_padding_mask: Tensor, default: None
+            Padding mask for interaction queries of size (B, N). Values of `True`
+            indicate the corresponding query was padded and to be ignored.
+        kv_padding_mask: Tensor, default: None
+            Padding mask for image features of size (B, HW).
+        kv_padding_mask_clip: Tensor, default: None
+            Padding mask for CLIP image features of size (B, HW).
+        q_pos: Tensor, default: None
+            Positional encodings for the interaction queries.
+        k_pos: Tensor, default: None
+            Positional encodings for the image features.
+        k_pos: Tensor, default: None
+            Positional encodings for the CLIP image features.
+
+        Returns:
+        --------
+        queries: Tensor
+        """
+        # Perform self attention amongst queries
+        q = self.q_attn_q_proj(queries)
+        k = self.q_attn_k_proj(queries)
+        v = self.q_attn_v_proj(queries)
+        q_p = self.q_attn_qpos_proj(q_pos["box"])
+        k_p = self.q_attn_kpos_proj(q_pos["box"])
+        q = q + q_p
+        k = k + k_p
+        q_attn = self.q_attn(
+            q, k, value=v, attn_mask=q_attn_mask,
+            key_padding_mask=q_padding_mask
+        )[0]
+        queries = self.ln1(queries + self.dp1(q_attn))
+        # Perform cross attention from memory features to queries
+        q = self.qk_attn_q_proj(queries)
+        k = self.qk_attn_k_proj(features)
+        v = self.qk_attn_v_proj(features)
+        q_p = self.qk_attn_qpos_proj(q_pos["centre"])
+        k_p = self.qk_attn_kpos_proj(k_pos)
+
+        n_q, bs, _ = q.shape
+        q = q.view(n_q, bs, self.num_heads, self.q_dim // self.num_heads)
+        q_p = q_p.view(n_q, bs, self.num_heads, self.q_dim // self.num_heads)
+        q = torch.cat([q, q_p], dim=3).view(n_q, bs, self.q_dim * 2)
+
+        hw, _, _ = k.shape
+        k = k.view(hw, bs, self.num_heads, self.q_dim // self.num_heads)
+        k_p = k_p.view(hw, bs, self.num_heads, self.q_dim // self.num_heads)
+        k = torch.cat([k, k_p], dim=3).view(hw, bs, self.q_dim * 2)
+
+        qk_attn = self.qk_attn(
+            query=q, key=k, value=v, attn_mask=qk_attn_mask,
+            key_padding_mask=kv_padding_mask
+        )[0]
+        queries1 = self.ln2(queries + self.dp2(qk_attn))
+        
+        # Perform cross attention from clip features to queries
+        q = self.qk_attn_q_proj(queries)
+        k = self.qk_attn_k_proj(clip_features)
+        v = self.qk_attn_v_proj(clip_features)
+        q_p = self.qk_attn_qpos_proj(q_pos["centre"])
+        k_p = self.qk_attn_kpos_proj(k_pos_clip)
+
+        n_q, bs, _ = q.shape
+        q = q.view(n_q, bs, self.num_heads, self.q_dim // self.num_heads)
+        q_p = q_p.view(n_q, bs, self.num_heads, self.q_dim // self.num_heads)
+        q = torch.cat([q, q_p], dim=3).view(n_q, bs, self.q_dim * 2)
+
+        hw, _, _ = k.shape
+        k = k.view(hw, bs, self.num_heads, self.q_dim // self.num_heads)
+        k_p = k_p.view(hw, bs, self.num_heads, self.q_dim // self.num_heads)
+        k = torch.cat([k, k_p], dim=3).view(hw, bs, self.q_dim * 2)
+
+        qk_attn = self.qk_attn(
+            query=q, key=k, value=v, attn_mask=qk_attn_mask,
+            key_padding_mask=kv_padding_mask_clip
+        )[0]
+        queries2 = self.ln2(queries + self.dp2(qk_attn))
+        
+        queries = queries1 + queries2
+        queries = self.ln3(queries + self.dp3(self.ffn(queries)))
+
+        return queries
+
 class TransformerDecoderLayer(nn.Module):
 
     def __init__(self, q_dim, kv_dim, num_heads, ffn_interm_dim, dropout=0.1):
@@ -210,6 +370,61 @@ class TransformerDecoderLayer(nn.Module):
         queries = self.ln3(queries + self.dp3(self.ffn(queries)))
 
         return queries
+
+class TransformerDecoder_CLIP(nn.Module):
+
+    def __init__(self, decoder_layer, num_layers, return_intermediate=True):
+        super().__init__()
+        self.layers = nn.ModuleList([copy.deepcopy(decoder_layer) for i in range(num_layers)])
+        self.num_layers = num_layers
+        self.norm = nn.LayerNorm(decoder_layer.q_dim)
+        self.return_intermediate = return_intermediate
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def forward(self, queries, features, clip_features,
+            q_attn_mask: Optional[Tensor] = None,
+            qk_attn_mask: Optional[Tensor] = None,
+            q_padding_mask: Optional[Tensor] = None,
+            kv_padding_mask: Optional[Tensor] = None,
+            kv_padding_mask_clip: Optional[Tensor] = None,
+            q_pos: Optional[Tensor] = None,
+            k_pos: Optional[Tensor] = None,
+            k_pos_clip: Optional[Tensor] = None,
+        ):
+        # Add support for zero layers
+        if self.num_layers == 0:
+            return queries.unsqueeze(0)
+        # Explicitly handle zero-size queries
+        if queries.numel() == 0:
+            rp = self.num_layers if self.return_intermediate else 1
+            return queries.unsqueeze(0).repeat(rp, 1, 1, 1)
+
+        output = queries
+        intermediate = []
+        for layer in self.layers:
+            output = layer(
+                output, features, clip_features, 
+                q_attn_mask=q_attn_mask,
+                qk_attn_mask=qk_attn_mask,
+                q_padding_mask=q_padding_mask,
+                kv_padding_mask=kv_padding_mask,
+                kv_padding_mask_clip=kv_padding_mask_clip,
+                q_pos=q_pos, k_pos=k_pos, k_pos_clip=k_pos_clip,
+            )
+            if self.return_intermediate:
+                intermediate.append(self.norm(output))
+
+        if self.return_intermediate:
+            output = torch.stack(intermediate)
+        else:
+            output = self.norm(output).unsqueeze(0)
+        return output
 
 class TransformerDecoder(nn.Module):
 

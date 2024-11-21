@@ -19,10 +19,10 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import matplotlib.patheffects as peff
 
-from utils import DataFactory
+from utils import DataFactory, DataFactory_CLIP
 from pvic import build_detector
 from configs import base_detector_args, advanced_detector_args
-
+import ModifiedCLIP as clip
 warnings.filterwarnings("ignore")
 
 def draw_boxes(ax, boxes):
@@ -82,8 +82,15 @@ def visualise_entire_image(image, output, attn, action=None, thresh=0.2):
 
 @torch.no_grad()
 def main(args):
-
-    dataset = DataFactory(name=args.dataset, partition=args.partition, data_root=args.data_root)
+    # device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.CLIP:
+        args.clip_model, args.clip_preprocess = clip.load(args.CLIP_path, device="cpu")
+        for param in args.clip_model.parameters():
+            param.requires_grad = False
+        args.clip_model.eval()
+        dataset = DataFactory_CLIP(name=args.dataset, partition=args.partition, data_root=args.data_root, args=args)
+    else:
+        dataset = DataFactory(name=args.dataset, partition=args.partition, data_root=args.data_root)
     conversion = dataset.dataset.object_to_verb if args.dataset == 'hicodet' \
         else list(dataset.dataset.object_to_action.values())
     args.num_verbs = 117 if args.dataset == 'hicodet' else 24
@@ -99,21 +106,33 @@ def main(args):
     if os.path.exists(args.resume):
         print(f"=> Continue from saved checkpoint {args.resume}")
         checkpoint = torch.load(args.resume, map_location='cpu')
-        model.load_state_dict(checkpoint['model_state_dict'])
+        model.load_state_dict(checkpoint['model_state_dict'], strict=False) # modified for load of clip
     else:
         print(f"=> Start from a randomly initialised model")
-
-    if args.image_path is None:
-        image, _ = dataset[args.index]
-        output = model([image])
-        image = dataset.dataset.load_image(
-            os.path.join(dataset.dataset._root,
-                dataset.dataset.filename(args.index)
-        ))
+    if args.CLIP:
+        if args.image_path is None:
+            image, target = dataset[args.index]
+            output = model([image], [target])
+            image = dataset.dataset.load_image(
+                os.path.join(dataset.dataset._root,
+                    dataset.dataset.filename(args.index)
+            ))
+        else:
+            image = dataset.dataset.load_image(args.image_path)
+            image_tensor, _ = dataset.transforms(image, None)
+            output = model([image_tensor])
     else:
-        image = dataset.dataset.load_image(args.image_path)
-        image_tensor, _ = dataset.transforms(image, None)
-        output = model([image_tensor])
+        if args.image_path is None:
+            image, _ = dataset[args.index]
+            output = model([image])
+            image = dataset.dataset.load_image(
+                os.path.join(dataset.dataset._root,
+                    dataset.dataset.filename(args.index)
+            ))
+        else:
+            image = dataset.dataset.load_image(args.image_path)
+            image_tensor, _ = dataset.transforms(image, None)
+            output = model([image_tensor])
 
     hook.remove()
 
@@ -136,7 +155,8 @@ if __name__ == "__main__":
         parser.add_argument('--raw-lambda', default=1.7, type=float)
 
     parser.add_argument('--partition', type=str, default="test2015")
-
+    parser.add_argument('--CLIP', action='store_true', help='use CLIP feature')
+    parser.add_argument('--CLIP_path', type=str)
     parser.add_argument('--kv-src', default='C5', type=str, choices=['C5', 'C4', 'C3'])
     parser.add_argument('--repr-dim', default=384, type=int)
     parser.add_argument('--triplet-enc-layers', default=1, type=int)
