@@ -172,6 +172,7 @@ if __name__ == '__main__':
         parser.add_argument('--raw-lambda', default=1.7, type=float)
 
     parser.add_argument('--CLIP', action='store_true', help='use CLIP feature')
+    parser.add_argument('--CLIP_text', action='store_true', help='use CLIP text feature')
     parser.add_argument('--CLIP_path', type=str)
     parser.add_argument('--kv-src', default='C5', type=str, choices=['C5', 'C4', 'C3'])
     parser.add_argument('--repr-dim', default=384, type=int)

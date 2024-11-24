@@ -40,6 +40,11 @@ from h_detr.models import build_model as build_advanced_detr
 from detr.models.position_encoding import PositionEmbeddingSine
 from detr.util.misc import NestedTensor, nested_tensor_from_tensor_list
 
+from datasets.hico_text_label import hico_text_label, hico_obj_text_label, hico_unseen_index
+from ModifiedCLIP import clip
+from collections import defaultdict
+import numpy as np
+
 class MultiModalFusion(nn.Module):
     def __init__(self, fst_mod_size, scd_mod_size, repr_size):
         super().__init__()
@@ -504,7 +509,7 @@ class PViC_CLIP(nn.Module):
         box_score_thresh: float = .05,
         min_instances: int = 3,
         max_instances: int = 15,
-        raw_lambda: float = 2.8,
+        raw_lambda: float = 2.8, args = None
     ) -> None:
         super().__init__()
 
@@ -520,8 +525,9 @@ class PViC_CLIP(nn.Module):
         self.kv_pe = PositionEmbeddingSine(128, 20, normalize=True)
         self.decoder = triplet_decoder
         self.clip_model = clip_model
+        self.CLIP_text = args.CLIP_text
         self.CLIPFeatureProjector = nn.Linear(768, 256)
-        # print("repr_size: ", repr_size)
+        self.CLIPtextFeatureProjector = nn.Linear(512, 384)
         self.binary_classifier = nn.Linear(repr_size, num_verbs)
 
         self.repr_size = repr_size
@@ -533,7 +539,24 @@ class PViC_CLIP(nn.Module):
         self.min_instances = min_instances
         self.max_instances = max_instances
         self.raw_lambda = raw_lambda
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        if self.CLIP_text:
+            self.clip_text_feature, self.object_to_verbs_and_indices = self.init_classifier_with_CLIP(hico_text_label)
+            
+    def init_classifier_with_CLIP(self, hoi_text_label):
+        device = next(self.clip_model.parameters()).device
+        text_inputs = torch.cat([clip.tokenize(hoi_text_label[id]) for id in hoi_text_label.keys()])
+        object_to_verbs_and_indices = defaultdict(list)
+        for index, key in enumerate(hoi_text_label.keys()):
+            verb_id, object_id = key
+            object_to_verbs_and_indices[object_id].append((verb_id, index))
 
+        clip_model = self.clip_model
+        clip_model.to(device)
+        with torch.no_grad():
+            text_embedding = clip_model.encode_text(text_inputs.to(device))
+        return text_embedding.float(), object_to_verbs_and_indices
+                   
     def freeze_detector(self):
         for p in self.detector.parameters():
             p.requires_grad = False
@@ -778,7 +801,20 @@ class PViC_CLIP(nn.Module):
             ).squeeze(dim=2))
         # Concatenate queries from all images in the same batch.
         query_embeds = torch.cat(query_embeds, dim=1)   # (ndec, \sigma{n}, q_dim)
-        logits = self.binary_classifier(query_embeds)
+        if self.CLIP_text:
+            query_embeds_flat = query_embeds.view(-1, query_embeds.size(-1))
+            similarity_matrix = F.cosine_similarity(query_embeds_flat.unsqueeze(1), self.CLIPtextFeatureProjector(self.clip_text_feature.unsqueeze(0)), dim=-1)
+            similarity_matrix = similarity_matrix.reshape(query_embeds.size(0), query_embeds.size(1), -1)
+            logits = torch.full((query_embeds.size(0), query_embeds.size(1), 117), -1.0, device=query_embeds.device)
+            concatenated_object_types = torch.cat(object_types, dim=0)
+            for i, object_id in enumerate(concatenated_object_types.tolist()):
+                verb_ids, indices = zip(*self.object_to_verbs_and_indices[object_id])
+                logits[:, i, verb_ids] = similarity_matrix[:, i, indices]
+
+            logit_scale = self.logit_scale.exp()
+            logits = logits * logit_scale
+        else:
+            logits = self.binary_classifier(query_embeds)
 
         if self.training:
             labels = associate_with_ground_truth(
@@ -856,6 +892,7 @@ def build_detector(args, obj_to_verb):
             min_instances=args.min_instances,
             max_instances=args.max_instances,
             raw_lambda=args.raw_lambda,
+            args=args
         )
     else:
         model = PViC(

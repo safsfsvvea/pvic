@@ -112,6 +112,9 @@ def main(args):
     if args.CLIP:
         if args.image_path is None:
             image, target = dataset[args.index]
+            # device = "cuda" if torch.cuda.is_available() else "cpu"
+            image= image.to("cpu")
+            model.to("cpu")
             output = model([image], [target])
             image = dataset.dataset.load_image(
                 os.path.join(dataset.dataset._root,
@@ -156,6 +159,7 @@ if __name__ == "__main__":
 
     parser.add_argument('--partition', type=str, default="test2015")
     parser.add_argument('--CLIP', action='store_true', help='use CLIP feature')
+    parser.add_argument('--CLIP_text', action='store_true', help='use CLIP text feature')
     parser.add_argument('--CLIP_path', type=str)
     parser.add_argument('--kv-src', default='C5', type=str, choices=['C5', 'C4', 'C3'])
     parser.add_argument('--repr-dim', default=384, type=int)
