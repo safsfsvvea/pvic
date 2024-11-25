@@ -173,6 +173,9 @@ if __name__ == '__main__':
 
     parser.add_argument('--CLIP', action='store_true', help='use CLIP feature')
     parser.add_argument('--CLIP_text', action='store_true', help='use CLIP text feature')
+    parser.add_argument('--CLIP_encoder', action='store_true', help='use CLIP feature in encoder stage')
+    parser.add_argument('--CLIP_decoder', action='store_true', help='use CLIP feature in decoder stage')
+    parser.add_argument('--clip4hoi_decoder', action='store_true', help='use clip4hoi decoder')
     parser.add_argument('--CLIP_path', type=str)
     parser.add_argument('--kv-src', default='C5', type=str, choices=['C5', 'C4', 'C3'])
     parser.add_argument('--repr-dim', default=384, type=int)

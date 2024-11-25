@@ -19,11 +19,13 @@ from torchvision.ops import FeaturePyramidNetwork
 
 from transformers import (
     TransformerEncoder,
+    TransformerEncoder_CLIP,
     TransformerDecoder,
     TransformerDecoder_CLIP,
     TransformerDecoderLayer,
     TransformerDecoderLayerCLIP,
     SwinTransformer,
+    Transformer_clip4hoi,
 )
 
 from ops import (
@@ -66,6 +68,114 @@ class MultiModalFusion(nn.Module):
         z = F.relu(torch.cat([x, y], dim=-1))
         z = self.mlp(z)
         return z
+
+class HumanObjectMatcher_CLIP(nn.Module):
+    def __init__(self, repr_size, num_verbs, obj_to_verb, dropout=.1, human_idx=0):
+        super().__init__()
+        self.repr_size = repr_size
+        self.num_verbs = num_verbs
+        self.human_idx = human_idx
+        self.obj_to_verb = obj_to_verb
+
+        self.ref_anchor_head = nn.Sequential(
+            nn.Linear(256, 256), nn.ReLU(),
+            nn.Linear(256, 2)
+        )
+        self.spatial_head = nn.Sequential(
+            nn.Linear(36, 128), nn.ReLU(),
+            nn.Linear(128, 256), nn.ReLU(),
+            nn.Linear(256, repr_size), nn.ReLU(),
+        )
+        self.encoder = TransformerEncoder(num_layers=2, dropout=dropout)
+        self.clip_cross_attention = TransformerEncoder_CLIP(num_layers=2, dropout=dropout)
+        self.mmf = MultiModalFusion(512, repr_size, repr_size)
+
+    def check_human_instances(self, labels):
+        is_human = labels == self.human_idx
+        n_h = torch.sum(is_human)
+        if not torch.all(labels[:n_h]==self.human_idx):
+            raise AssertionError("Human instances are not permuted to the top!")
+        return n_h
+
+    def compute_box_pe(self, boxes, embeds, image_size):
+        bx_norm = boxes / image_size[[1, 0, 1, 0]]
+        bx_c = (bx_norm[:, :2] + bx_norm[:, 2:]) / 2
+        b_wh = bx_norm[:, 2:] - bx_norm[:, :2]
+
+        c_pe = compute_sinusoidal_pe(bx_c[:, None], 20).squeeze(1)
+        wh_pe = compute_sinusoidal_pe(b_wh[:, None], 20).squeeze(1)
+
+        box_pe = torch.cat([c_pe, wh_pe], dim=-1)
+
+        # Modulate the positional embeddings with box widths and heights by
+        # applying different temperatures to x and y
+        ref_hw_cond = self.ref_anchor_head(embeds).sigmoid()    # n_query, 2
+        # Note that the positional embeddings are stacked as [pe(y), pe(x)]
+        c_pe[..., :128] *= (ref_hw_cond[:, 1] / b_wh[:, 1]).unsqueeze(-1)
+        c_pe[..., 128:] *= (ref_hw_cond[:, 0] / b_wh[:, 0]).unsqueeze(-1)
+
+        return box_pe, c_pe
+
+    def forward(self, region_props, image_sizes, clip_visual, device=None):
+        if device is None:
+            device = region_props[0]["hidden_states"].device
+
+        ho_queries = []
+        paired_indices = []
+        prior_scores = []
+        object_types = []
+        positional_embeds = []
+        # print("len(region_props): ", len(region_props))
+        for i, rp in enumerate(region_props):
+            boxes, scores, labels, embeds = rp.values()
+            nh = self.check_human_instances(labels)
+            n = len(boxes)
+            # Enumerate instance pairs
+            x, y = torch.meshgrid(
+                torch.arange(n, device=device),
+                torch.arange(n, device=device)
+            )
+            x_keep, y_keep = torch.nonzero(torch.logical_and(x != y, x < nh)).unbind(1)
+            # Skip image when there are no valid human-object pairs
+            if len(x_keep) == 0:
+                ho_queries.append(torch.zeros(0, self.repr_size, device=device))
+                paired_indices.append(torch.zeros(0, 2, device=device, dtype=torch.int64))
+                prior_scores.append(torch.zeros(0, 2, self.num_verbs, device=device))
+                object_types.append(torch.zeros(0, device=device, dtype=torch.int64))
+                positional_embeds.append({})
+                continue
+            x = x.flatten(); y = y.flatten()
+            # Compute spatial features
+            pairwise_spatial = compute_spatial_encodings(
+                [boxes[x],], [boxes[y],], [image_sizes[i],]
+            )
+            pairwise_spatial = self.spatial_head(pairwise_spatial)
+            pairwise_spatial_reshaped = pairwise_spatial.reshape(n, n, -1)
+
+            box_pe, c_pe = self.compute_box_pe(boxes, embeds, image_sizes[i])
+            embeds, _ = self.encoder(embeds.unsqueeze(1), box_pe.unsqueeze(1))
+            embeds, _ = self.clip_cross_attention(embeds, clip_visual[i].unsqueeze(1))
+            # print("embeds.shape: ", embeds.shape)
+            embeds = embeds.squeeze(1)
+            # Compute human-object queries
+            ho_q = self.mmf(
+                torch.cat([embeds[x_keep], embeds[y_keep]], dim=1),
+                pairwise_spatial_reshaped[x_keep, y_keep]
+            )
+            # Append matched human-object pairs
+            ho_queries.append(ho_q)
+            paired_indices.append(torch.stack([x_keep, y_keep], dim=1))
+            prior_scores.append(compute_prior_scores(
+                x_keep, y_keep, scores, labels, self.num_verbs, self.training,
+                self.obj_to_verb
+            ))
+            object_types.append(labels[y_keep])
+            positional_embeds.append({
+                "centre": torch.cat([c_pe[x_keep], c_pe[y_keep]], dim=-1).unsqueeze(1),
+                "box": torch.cat([box_pe[x_keep], box_pe[y_keep]], dim=-1).unsqueeze(1)
+            })
+
+        return ho_queries, paired_indices, prior_scores, object_types, positional_embeds
 
 class HumanObjectMatcher(nn.Module):
     def __init__(self, repr_size, num_verbs, obj_to_verb, dropout=.1, human_idx=0):
@@ -150,6 +260,7 @@ class HumanObjectMatcher(nn.Module):
 
             box_pe, c_pe = self.compute_box_pe(boxes, embeds, image_sizes[i])
             embeds, _ = self.encoder(embeds.unsqueeze(1), box_pe.unsqueeze(1))
+            print("embeds.shape: ", embeds.shape)
             embeds = embeds.squeeze(1)
             # Compute human-object queries
             ho_q = self.mmf(
@@ -509,7 +620,7 @@ class PViC_CLIP(nn.Module):
         box_score_thresh: float = .05,
         min_instances: int = 3,
         max_instances: int = 15,
-        raw_lambda: float = 2.8, args = None
+        raw_lambda: float = 2.8, clip4hoi_decoder=None, args = None
     ) -> None:
         super().__init__()
 
@@ -524,11 +635,18 @@ class PViC_CLIP(nn.Module):
         self.feature_head = feature_head
         self.kv_pe = PositionEmbeddingSine(128, 20, normalize=True)
         self.decoder = triplet_decoder
+        self.clip4hoi_decoder = clip4hoi_decoder
         self.clip_model = clip_model
         self.CLIP_text = args.CLIP_text
+        self.CLIP_encoder = args.CLIP_encoder
+        self.CLIP_decoder = args.CLIP_decoder
         self.CLIPFeatureProjector = nn.Linear(768, 256)
         self.CLIPtextFeatureProjector = nn.Linear(512, 384)
-        self.binary_classifier = nn.Linear(repr_size, num_verbs)
+        self.qeury_to_clip_projector = nn.Linear(384, 768)
+        if self.clip4hoi_decoder is None:
+            self.binary_classifier = nn.Linear(repr_size, num_verbs)
+        else:
+            self.binary_classifier = nn.Linear(768, num_verbs)
 
         self.repr_size = repr_size
         self.human_idx = human_idx
@@ -755,7 +873,11 @@ class PViC_CLIP(nn.Module):
         with torch.no_grad():
             results, hs, features = self.od_forward(self.detector, images)
             results = self.postprocessor(results, image_sizes)
-            clip_cls, clip_visual = self.clip_model.encode_image(clip_input)
+            clip_cls, clip_visual_ori = self.clip_model.encode_image(clip_input)
+        clip_visual_ori = clip_visual_ori.to(self.CLIPFeatureProjector.weight.dtype)
+            # print("clip_visual_ori.shape: ", clip_visual_ori.shape)
+            # print("clip_cls.shape: ", clip_cls.shape)
+        clip_visual = self.CLIPFeatureProjector(clip_visual_ori)
         # print("clip_visual: ", clip_visual.shape)
         region_props = prepare_region_proposals(
             results, hs[-1], image_sizes,
@@ -766,11 +888,18 @@ class PViC_CLIP(nn.Module):
         )
         boxes = [r['boxes'] for r in region_props]
         # Produce human-object pairs.
-        (
-            ho_queries,
-            paired_inds, prior_scores,
-            object_types, positional_embeds
-        ) = self.ho_matcher(region_props, image_sizes)
+        if self.CLIP_encoder:
+            (
+                ho_queries,
+                paired_inds, prior_scores,
+                object_types, positional_embeds
+            ) = self.ho_matcher(region_props, image_sizes, clip_visual)
+        else:
+            (
+                ho_queries,
+                paired_inds, prior_scores,
+                object_types, positional_embeds
+            ) = self.ho_matcher(region_props, image_sizes)
         # Compute keys/values for triplet decoder.
         # print("features len: ", len(features))
         # print("features[0].tensors.shape: ", features[0].tensors.shape)
@@ -780,7 +909,7 @@ class PViC_CLIP(nn.Module):
         # print("self.CLIPFeatureProjector.weight.dtype: ", self.CLIPFeatureProjector.weight.dtype)  # 查看类型
         # print("clip_visual.dtype: ", clip_visual.dtype)  # 查看类型
         # print("memory.dtype: ", memory.dtype)
-        clip_visual = self.CLIPFeatureProjector(clip_visual.to(self.CLIPFeatureProjector.weight.dtype))
+        
         B, L, C = clip_visual.shape
         mask_clip = torch.zeros(B, 1, L, dtype=torch.bool, device=images[0].device)
         memory = memory.reshape(b, h * w, c)
@@ -789,22 +918,54 @@ class PViC_CLIP(nn.Module):
         k_pos_clip = self.kv_pe(NestedTensor(clip_visual, mask_clip)).permute(0, 2, 3, 1).reshape(B, L, 1, C)
         # Enhance visual context with triplet decoder.
         query_embeds = []
-        for i, (ho_q, mem, clip_vis) in enumerate(zip(ho_queries, memory, clip_visual)):
-            query_embeds.append(self.decoder(
-                ho_q.unsqueeze(1),              # (n, 1, q_dim)
-                mem.unsqueeze(1),               # (hw, 1, kv_dim)
-                clip_features=clip_vis.unsqueeze(1),
-                kv_padding_mask=kv_p_m[i],      # (1, hw)
-                q_pos=positional_embeds[i],     # centre: (n, 1, 2*kv_dim), box: (n, 1, 4*kv_dim)
-                k_pos=k_pos[i],                  # (hw, 1, kv_dim)
-                k_pos_clip=k_pos_clip[i]
-            ).squeeze(dim=2))
+        if self.CLIP_decoder:
+            for i, (ho_q, mem, clip_vis) in enumerate(zip(ho_queries, memory, clip_visual)):
+                query_embeds.append(self.decoder(
+                    ho_q.unsqueeze(1),              # (n, 1, q_dim)
+                    mem.unsqueeze(1),               # (hw, 1, kv_dim)
+                    clip_features=clip_vis.unsqueeze(1),
+                    kv_padding_mask=kv_p_m[i],      # (1, hw)
+                    q_pos=positional_embeds[i],     # centre: (n, 1, 2*kv_dim), box: (n, 1, 4*kv_dim)
+                    k_pos=k_pos[i],                  # (hw, 1, kv_dim)
+                    k_pos_clip=k_pos_clip[i]
+                ).squeeze(dim=2))
+        else:
+            for i, (ho_q, mem) in enumerate(zip(ho_queries, memory)):
+                query_embeds.append(self.decoder(
+                    ho_q.unsqueeze(1),              # (n, 1, q_dim)
+                    mem.unsqueeze(1),               # (hw, 1, kv_dim)
+                    kv_padding_mask=kv_p_m[i],      # (1, hw)
+                    q_pos=positional_embeds[i],     # centre: (n, 1, 2*kv_dim), box: (n, 1, 4*kv_dim)
+                    k_pos=k_pos[i]                  # (hw, 1, kv_dim)
+                ).squeeze(dim=2))
+        if self.clip4hoi_decoder is not None:
+            final_query_embeds = []
+            for i, (ho_q, clip_vis) in enumerate(zip(query_embeds, clip_visual_ori)):
+                final_query_embeds.append(self.clip4hoi_decoder(
+                    self.qeury_to_clip_projector(ho_q[-1]).unsqueeze(1),
+                    clip_vis[1:].unsqueeze(1),
+                    clip_vis[0:1].unsqueeze(1)
+                ).squeeze(dim=2))
+            query_embeds = final_query_embeds
+            # final_query_embeds = torch.cat(final_query_embeds, dim=1)
+            # print("final_query_embeds shape: ", final_query_embeds.shape)
         # Concatenate queries from all images in the same batch.
         query_embeds = torch.cat(query_embeds, dim=1)   # (ndec, \sigma{n}, q_dim)
+        # print("query_embeds shape: ", query_embeds.shape)
         if self.CLIP_text:
             query_embeds_flat = query_embeds.view(-1, query_embeds.size(-1))
             similarity_matrix = F.cosine_similarity(query_embeds_flat.unsqueeze(1), self.CLIPtextFeatureProjector(self.clip_text_feature.unsqueeze(0)), dim=-1)
             similarity_matrix = similarity_matrix.reshape(query_embeds.size(0), query_embeds.size(1), -1)
+            # last_similarity_matrix = similarity_matrix[-1]  # shape = (query_embeds.size(1), dim)
+
+            # # 获取每行的 top 5 值及其对应的索引
+            # top5_values, top5_indices = torch.topk(last_similarity_matrix, k=5, dim=-1)
+
+            # # 打印结果
+            # for i, (values, indices) in enumerate(zip(top5_values, top5_indices)):
+            #     print(f"Query {i}:")
+            #     print(f"Top 5 similarities: {values.tolist()}")
+            #     print(f"Indices: {indices.tolist()}")
             logits = torch.full((query_embeds.size(0), query_embeds.size(1), 117), -1.0, device=query_embeds.device)
             concatenated_object_types = torch.cat(object_types, dim=0)
             for i, object_id in enumerate(concatenated_object_types.tolist()):
@@ -813,8 +974,29 @@ class PViC_CLIP(nn.Module):
 
             logit_scale = self.logit_scale.exp()
             logits = logits * logit_scale
+            # print("logits shape: ", logits.shape)
+            # selected_logits = logits[1, 0, :]
+            # selected_probs = torch.sigmoid(selected_logits)
+            # import matplotlib.pyplot as plt
+
+            # selected_probs_np = selected_probs.cpu().numpy()
+
+            # plt.figure(figsize=(8, 6))
+            # plt.hist(selected_probs_np, bins=50, color='blue', alpha=0.7)
+            # plt.xlabel("Sigmoid Probability")
+            # plt.ylabel("Frequency")
+            # plt.title("Distribution of Sigmoid Probabilities for [1, 0, :]")
+            # plt.grid(True)
+
+            # save_path = "sigmoid_distribution.png"
+            # plt.savefig(save_path, dpi=300, bbox_inches='tight')  # 高分辨率保存
+            # print(f"Figure saved to {save_path}")
+
+            # plt.close()
+
         else:
             logits = self.binary_classifier(query_embeds)
+            # print("logits.shape: ", logits.shape)
 
         if self.training:
             labels = associate_with_ground_truth(
@@ -842,14 +1024,21 @@ def build_detector(args, obj_to_verb):
         else:
             print(f"Load weights for the object detector from {args.pretrained}")
         detr.load_state_dict(torch.load(args.pretrained, map_location='cpu')['model_state_dict'])
-
-    ho_matcher = HumanObjectMatcher(
-        repr_size=args.repr_dim,
-        num_verbs=args.num_verbs,
-        obj_to_verb=obj_to_verb,
-        dropout=args.dropout
-    )
-    if args.CLIP:
+    if args.CLIP_encoder:
+        ho_matcher = HumanObjectMatcher_CLIP(
+            repr_size=args.repr_dim,
+            num_verbs=args.num_verbs,
+            obj_to_verb=obj_to_verb,
+            dropout=args.dropout
+        )
+    else:
+        ho_matcher = HumanObjectMatcher(
+            repr_size=args.repr_dim,
+            num_verbs=args.num_verbs,
+            obj_to_verb=obj_to_verb,
+            dropout=args.dropout
+        )
+    if args.CLIP_decoder:
         decoder_layer = TransformerDecoderLayerCLIP(
             q_dim=args.repr_dim, kv_dim=args.hidden_dim,
             ffn_interm_dim=args.repr_dim * 4,
@@ -869,6 +1058,10 @@ def build_detector(args, obj_to_verb):
             decoder_layer=decoder_layer,
             num_layers=args.triplet_dec_layers
         )
+    if args.clip4hoi_decoder:
+        clip4hoi_decoder = Transformer_clip4hoi()
+    else:
+        clip4hoi_decoder = None
     return_layer = {"C5": -1, "C4": -2, "C3": -3}[args.kv_src]
     if isinstance(detr.backbone.num_channels, list):
         num_channels = detr.backbone.num_channels[-1]
@@ -892,6 +1085,7 @@ def build_detector(args, obj_to_verb):
             min_instances=args.min_instances,
             max_instances=args.max_instances,
             raw_lambda=args.raw_lambda,
+            clip4hoi_decoder=clip4hoi_decoder,
             args=args
         )
     else:

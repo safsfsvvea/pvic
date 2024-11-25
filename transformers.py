@@ -22,6 +22,120 @@ from torch import nn, Tensor
 from attention import MultiheadAttention
 from typing import List, Optional, Callable
 
+class TransformerLayer_clp4hoi(nn.Module):
+    def __init__(self, dim, num_heads, ffn_interm_dim, dropout=0.1):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.ffn_interm_dim = ffn_interm_dim
+        self.MHCA = nn.MultiheadAttention(dim, num_heads, dropout=dropout)
+        self.MHSA = nn.MultiheadAttention(dim, num_heads, dropout=dropout)
+
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, ffn_interm_dim), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(ffn_interm_dim, dim)
+        )
+        self.ln1 = nn.LayerNorm(dim)
+        self.ln2 = nn.LayerNorm(dim)
+        self.ln3 = nn.LayerNorm(dim)
+        self.ln4 = nn.LayerNorm(dim)
+        self.dp = nn.Dropout(dropout)
+
+    def forward(self, H, F, I,
+            attn_mask: Optional[Tensor] = None,
+            key_padding_mask: Optional[Tensor] = None,
+        ):
+        """
+        Parameters:
+        -----------
+        H: tensor
+            Input query.
+        F: tensor
+            Patch level CLIP image features.
+        I: tensor
+            Global CLIP image class token.
+        """
+        H1, _ = self.MHCA(
+            query=self.ln1(H), key=self.ln2(F), value=self.ln2(F),
+            attn_mask=attn_mask, key_padding_mask=key_padding_mask
+        )
+        H1 = self.dp(H1)
+        q1 = torch.cat((I,H1), dim=0)
+        H2, _ = self.MHSA(
+            query=self.ln3(q1), key=self.ln3(q1), value=self.ln3(q1),
+            attn_mask=attn_mask, key_padding_mask=key_padding_mask
+        )
+        H2 = self.dp(H2) + q1
+        output = self.dp(self.ffn(self.ln4(H2[1:]))) + H2[1:]
+        return output
+
+class Transformer_clip4hoi(nn.Module):
+    def __init__(self, hidden_size=768, num_heads=12, num_layers=6, dropout=.1):
+        super().__init__()
+        self.num_layers = num_layers
+        self.layers = nn.ModuleList([TransformerLayer_clp4hoi(
+            dim=hidden_size, num_heads=num_heads,
+            ffn_interm_dim=hidden_size * 4, dropout=dropout
+        ) for _ in range(num_layers)])
+
+    def forward(self, queries, clip_patch, clip_cls):
+        # Add support for zero layers
+        if self.num_layers == 0:
+            return queries.unsqueeze(0)
+        # Explicitly handle zero-size queries
+        if queries.numel() == 0:
+            rp = 1
+            return queries.unsqueeze(0).repeat(rp, 1, 1, 1)
+        for layer in self.layers:
+            queries = layer(queries, clip_patch, clip_cls)
+        return queries.unsqueeze(0)
+
+class TransformerEncoderLayer_CLIP(nn.Module):
+    def __init__(self, dim, num_heads, ffn_interm_dim, dropout=0.1):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.ffn_interm_dim = ffn_interm_dim
+        # Linear projections on qkv have been removed in this custom layer.
+        self.attn = MultiheadAttention(dim, num_heads, dropout=dropout)
+        # Add the missing linear projections.
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        # The positional embeddings include box centres, widths and heights,
+        # which will be twice the representation size.
+        self.qpos_proj = nn.Linear(2 * dim, dim)
+        self.kpos_proj = nn.Linear(2 * dim, dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, ffn_interm_dim), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(ffn_interm_dim, dim)
+        )
+        self.ln1 = nn.LayerNorm(dim)
+        self.ln2 = nn.LayerNorm(dim)
+        self.dp1 = nn.Dropout(dropout)
+        self.dp2 = nn.Dropout(dropout)
+
+    def forward(self, x, clip_feature, pos=None,
+            attn_mask: Optional[Tensor] = None,
+            key_padding_mask: Optional[Tensor] = None,
+        ):
+        q = self.q_proj(x)
+        k = self.k_proj(clip_feature)
+        v = self.v_proj(clip_feature)
+        # q_pos = self.qpos_proj(pos)
+        # k_pos = self.kpos_proj(pos)
+        # q = q + q_pos
+        # k = k + k_pos
+        attn, attn_weights = self.attn(
+            query=q, key=k, value=v,
+            attn_mask=attn_mask, key_padding_mask=key_padding_mask
+        )
+        x = self.ln1(x + self.dp1(attn))
+        x = self.ln2(x + self.dp2(self.ffn(x)))
+        return x, attn_weights
+
 class TransformerEncoderLayer(nn.Module):
     def __init__(self, dim, num_heads, ffn_interm_dim, dropout=0.1):
         super().__init__()
@@ -80,6 +194,22 @@ class TransformerEncoder(nn.Module):
         attn_weights = []
         for layer in self.layers:
             x, attn = layer(x, pos)
+            attn_weights.append(attn)
+        return x, attn_weights
+
+class TransformerEncoder_CLIP(nn.Module):
+    def __init__(self, hidden_size=256, num_heads=8, num_layers=2, dropout=.1):
+        super().__init__()
+        self.num_layers = num_layers
+        self.layers = nn.ModuleList([TransformerEncoderLayer_CLIP(
+            dim=hidden_size, num_heads=num_heads,
+            ffn_interm_dim=hidden_size * 4, dropout=dropout
+        ) for _ in range(num_layers)])
+
+    def forward(self, x, clip_feature):
+        attn_weights = []
+        for layer in self.layers:
+            x, attn = layer(x, clip_feature)
             attn_weights.append(attn)
         return x, attn_weights
 
