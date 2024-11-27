@@ -641,7 +641,13 @@ class PViC_CLIP(nn.Module):
         self.CLIP_encoder = args.CLIP_encoder
         self.CLIP_decoder = args.CLIP_decoder
         self.CLIPFeatureProjector = nn.Linear(768, 256)
-        self.CLIPtextFeatureProjector = nn.Linear(512, 384)
+        # self.CLIPtextFeatureProjector = nn.Linear(512, 384)
+        self.CLIPtextFeatureProjector = nn.Sequential(
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(512, 384)
+        )
         self.qeury_to_clip_projector = nn.Linear(384, 768)
         if self.clip4hoi_decoder is None:
             self.binary_classifier = nn.Linear(repr_size, num_verbs)
