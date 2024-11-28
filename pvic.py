@@ -260,7 +260,7 @@ class HumanObjectMatcher(nn.Module):
 
             box_pe, c_pe = self.compute_box_pe(boxes, embeds, image_sizes[i])
             embeds, _ = self.encoder(embeds.unsqueeze(1), box_pe.unsqueeze(1))
-            print("embeds.shape: ", embeds.shape)
+            # print("embeds.shape: ", embeds.shape)
             embeds = embeds.squeeze(1)
             # Compute human-object queries
             ho_q = self.mmf(
