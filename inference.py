@@ -44,10 +44,17 @@ def visualise_entire_image(image, output, attn, action=None, thresh=0.2):
         ow / w, oh / h, ow / w, oh / h
     ]).unsqueeze(0)
     boxes = output['boxes'] * scale_fct
-
+    # print("boxes: ", boxes)
     image_copy = image.copy()
     scores = output['scores']
     pred = output['labels']
+    # print("scores: ", scores)
+    # print("pred: ", pred)
+    # indices = pred == 57
+    # selected_scores = scores[indices]
+    # print("Selected scores for pred == 57: ", selected_scores)
+    thresh = 0.1
+    pocket.utils.draw_boxes(image, boxes, width=3)
     # Visualise detected human-object pairs with attached scores
     if action is not None:
         keep = torch.nonzero(torch.logical_and(scores >= thresh, pred == action)).squeeze(1)
@@ -80,6 +87,29 @@ def visualise_entire_image(image, output, attn, action=None, thresh=0.2):
                     pocket.advis.heatmap(attn_image, attn_map[j: j+1], save_path=f"pair_{i}_attn_head_{j+1}.png")
                     plt.close()
 
+def to_cpu(output):
+    """
+    Recursively transfers all torch.Tensors in a nested dictionary or list to CPU.
+    
+    Parameters:
+    ----------
+    output : dict or list
+        The model output containing nested dictionaries/lists with torch.Tensors.
+
+    Returns:
+    -------
+    Same structure as input with all torch.Tensors moved to CPU.
+    """
+    if isinstance(output, torch.Tensor):
+        return output.cpu()
+    elif isinstance(output, dict):
+        return {key: to_cpu(value) for key, value in output.items()}
+    elif isinstance(output, list):
+        return [to_cpu(item) for item in output]
+    else:
+        # If it's not a tensor, list, or dict, return as is.
+        return output
+
 @torch.no_grad()
 def main(args):
     # device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -109,15 +139,16 @@ def main(args):
         model.load_state_dict(checkpoint['model_state_dict'], strict=False) # modified for load of clip
     else:
         print(f"=> Start from a randomly initialised model")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
     if args.CLIP:
         if args.image_path is None:
             image, target = dataset[args.index]
-            # device = "cuda" if torch.cuda.is_available() else "cpu"
-            image= image.to("cpu")
-            model.to("cpu")
+            image= image.to(device)
             # logit_scale = model.logit_scale.item()
             # print(f"logit_scale: {logit_scale}")
             output = model([image], [target])
+            output = to_cpu(output)
             image = dataset.dataset.load_image(
                 os.path.join(dataset.dataset._root,
                     dataset.dataset.filename(args.index)
@@ -125,11 +156,17 @@ def main(args):
         else:
             image = dataset.dataset.load_image(args.image_path)
             image_tensor, _ = dataset.transforms(image, None)
+            image_tensor= image_tensor.to(device)
             output = model([image_tensor])
+            output = to_cpu(output)
     else:
         if args.image_path is None:
             image, _ = dataset[args.index]
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            image= image.to(device)
+            model.to(device)
             output = model([image])
+            output = to_cpu(output)
             image = dataset.dataset.load_image(
                 os.path.join(dataset.dataset._root,
                     dataset.dataset.filename(args.index)
@@ -137,10 +174,13 @@ def main(args):
         else:
             image = dataset.dataset.load_image(args.image_path)
             image_tensor, _ = dataset.transforms(image, None)
+            image_tensor= image_tensor.to(device)
             output = model([image_tensor])
+            output = to_cpu(output)
 
     hook.remove()
-
+    attn_weights = to_cpu(attn_weights)
+    # print("output: ", output)
     visualise_entire_image(
         image, output[0], attn_weights[0],
         args.action, args.action_score_thresh

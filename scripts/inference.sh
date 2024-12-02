@@ -1,2 +1,0 @@
-#!/bin/bash
-DETR=base python inference.py --resume /bd_byt4090i1/users/clin/pvic/outputs/clip_encoder_decoder/best.pth --index 4050 --action 111 --CLIP --CLIP_path /bd_targaryen/users/clin/pvic/checkpoints/clip/ViT-B-32.pt --CLIP_decoder --CLIP_encoder --clip4hoi_decoder #--CLIP_text 
