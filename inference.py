@@ -53,8 +53,8 @@ def visualise_entire_image(image, output, attn, action=None, thresh=0.2):
     # indices = pred == 57
     # selected_scores = scores[indices]
     # print("Selected scores for pred == 57: ", selected_scores)
-    thresh = 0.1
-    pocket.utils.draw_boxes(image, boxes, width=3)
+    # thresh = 0.1
+    # pocket.utils.draw_boxes(image, boxes, width=3)
     # Visualise detected human-object pairs with attached scores
     if action is not None:
         keep = torch.nonzero(torch.logical_and(scores >= thresh, pred == action)).squeeze(1)
@@ -162,7 +162,6 @@ def main(args):
     else:
         if args.image_path is None:
             image, _ = dataset[args.index]
-            device = "cuda" if torch.cuda.is_available() else "cpu"
             image= image.to(device)
             model.to(device)
             output = model([image])
