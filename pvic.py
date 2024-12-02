@@ -882,7 +882,12 @@ class PViC_CLIP(nn.Module):
             clip_cls, clip_visual_ori = self.clip_model.encode_image(clip_input)
         clip_visual_ori = clip_visual_ori.to(self.CLIPFeatureProjector.weight.dtype)
             # print("clip_visual_ori.shape: ", clip_visual_ori.shape)
-            # print("clip_cls.shape: ", clip_cls.shape)
+        # print("clip_cls.shape: ", clip_cls.shape)
+        # similarity_matrix_image = F.cosine_similarity(clip_cls.unsqueeze(1), self.clip_text_feature.unsqueeze(0), dim=-1)
+        # topk_values_image, topk_indices_image = torch.topk(similarity_matrix_image, k=5, dim=-1)
+        # print("Top 5 values:", topk_values_image)
+        # print("Top 5 indices:", topk_indices_image)
+        
         clip_visual = self.CLIPFeatureProjector(clip_visual_ori)
         # print("clip_visual: ", clip_visual.shape)
         region_props = prepare_region_proposals(
@@ -962,6 +967,7 @@ class PViC_CLIP(nn.Module):
             query_embeds_flat = query_embeds.view(-1, query_embeds.size(-1))
             similarity_matrix = F.cosine_similarity(query_embeds_flat.unsqueeze(1), self.CLIPtextFeatureProjector(self.clip_text_feature.unsqueeze(0)), dim=-1)
             similarity_matrix = similarity_matrix.reshape(query_embeds.size(0), query_embeds.size(1), -1)
+            
             # last_similarity_matrix = similarity_matrix[-1]  # shape = (query_embeds.size(1), dim)
 
             # # 获取每行的 top 5 值及其对应的索引
