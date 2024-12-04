@@ -565,6 +565,13 @@ class PViC(nn.Module):
             min_instances=self.min_instances,
             max_instances=self.max_instances
         )
+        print("region_props[0]['labels']: ", region_props[0]['labels'])
+        print("region_props[0]['scores']: ", region_props[0]['scores'])
+        print("region_props[1]['labels']: ", region_props[1]['labels'])
+        print("region_props[1]['scores']: ", region_props[1]['scores'])
+        print("region_props[0]['hidden_states'].shape: ", region_props[0]['hidden_states'].shape)
+        region_props[0]['hidden_states'][3] = region_props[1]['hidden_states'][3]
+        region_props = region_props[:1]
         boxes = [r['boxes'] for r in region_props]
         # Produce human-object pairs.
         (
@@ -897,6 +904,7 @@ class PViC_CLIP(nn.Module):
             min_instances=self.min_instances,
             max_instances=self.max_instances
         )
+        
         boxes = [r['boxes'] for r in region_props]
         # Produce human-object pairs.
         if self.CLIP_encoder:

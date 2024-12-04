@@ -53,8 +53,8 @@ def visualise_entire_image(image, output, attn, action=None, thresh=0.2):
     # indices = pred == 57
     # selected_scores = scores[indices]
     # print("Selected scores for pred == 57: ", selected_scores)
-    thresh = 0.1
-    pocket.utils.draw_boxes(image, boxes, width=3)
+    # thresh = 0.1
+    # pocket.utils.draw_boxes(image, boxes, width=3)
     # Visualise detected human-object pairs with attached scores
     if action is not None:
         keep = torch.nonzero(torch.logical_and(scores >= thresh, pred == action)).squeeze(1)
@@ -141,42 +141,56 @@ def main(args):
         print(f"=> Start from a randomly initialised model")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
-    if args.CLIP:
-        if args.image_path is None:
-            image, target = dataset[args.index]
-            image= image.to(device)
-            # logit_scale = model.logit_scale.item()
-            # print(f"logit_scale: {logit_scale}")
-            output = model([image], [target])
-            output = to_cpu(output)
-            image = dataset.dataset.load_image(
-                os.path.join(dataset.dataset._root,
-                    dataset.dataset.filename(args.index)
-            ))
-        else:
-            image = dataset.dataset.load_image(args.image_path)
-            image_tensor, _ = dataset.transforms(image, None)
-            image_tensor= image_tensor.to(device)
-            output = model([image_tensor])
-            output = to_cpu(output)
+    if args.replace_feature:
+        image, _ = dataset[args.index]
+        image1 = dataset.dataset.load_image(args.image_path)
+        image_tensor, _ = dataset.transforms(image1, None)
+        image_tensor= image_tensor.to(device)
+        image= image.to(device)
+        model.to(device)
+        output = model([image, image_tensor])
+        output = to_cpu(output)
+        image = dataset.dataset.load_image(
+            os.path.join(dataset.dataset._root,
+                dataset.dataset.filename(args.index)
+        ))
+        
     else:
-        if args.image_path is None:
-            image, _ = dataset[args.index]
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            image= image.to(device)
-            model.to(device)
-            output = model([image])
-            output = to_cpu(output)
-            image = dataset.dataset.load_image(
-                os.path.join(dataset.dataset._root,
-                    dataset.dataset.filename(args.index)
-            ))
+        if args.CLIP:
+            if args.image_path is None:
+                image, target = dataset[args.index]
+                image= image.to(device)
+                # logit_scale = model.logit_scale.item()
+                # print(f"logit_scale: {logit_scale}")
+                output = model([image], [target])
+                output = to_cpu(output)
+                image = dataset.dataset.load_image(
+                    os.path.join(dataset.dataset._root,
+                        dataset.dataset.filename(args.index)
+                ))
+            else:
+                image = dataset.dataset.load_image(args.image_path)
+                image_tensor, _ = dataset.transforms(image, None)
+                image_tensor= image_tensor.to(device)
+                output = model([image_tensor])
+                output = to_cpu(output)
         else:
-            image = dataset.dataset.load_image(args.image_path)
-            image_tensor, _ = dataset.transforms(image, None)
-            image_tensor= image_tensor.to(device)
-            output = model([image_tensor])
-            output = to_cpu(output)
+            if args.image_path is None:
+                image, _ = dataset[args.index]
+                image= image.to(device)
+                model.to(device)
+                output = model([image])
+                output = to_cpu(output)
+                image = dataset.dataset.load_image(
+                    os.path.join(dataset.dataset._root,
+                        dataset.dataset.filename(args.index)
+                ))
+            else:
+                image = dataset.dataset.load_image(args.image_path)
+                image_tensor, _ = dataset.transforms(image, None)
+                image_tensor= image_tensor.to(device)
+                output = model([image_tensor])
+                output = to_cpu(output)
 
     hook.remove()
     attn_weights = to_cpu(attn_weights)
@@ -200,6 +214,7 @@ if __name__ == "__main__":
         parser.add_argument('--raw-lambda', default=1.7, type=float)
 
     parser.add_argument('--partition', type=str, default="test2015")
+    parser.add_argument('--replace_feature', action='store_true', help='replace object feature')
     parser.add_argument('--CLIP', action='store_true', help='use CLIP feature')
     parser.add_argument('--CLIP_text', action='store_true', help='use CLIP text feature')
     parser.add_argument('--CLIP_encoder', action='store_true', help='use CLIP feature in encoder stage')
