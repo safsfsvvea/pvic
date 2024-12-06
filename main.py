@@ -197,7 +197,7 @@ if __name__ == '__main__':
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--cache', action='store_true')
     parser.add_argument('--sanity', action='store_true')
-
+    parser.add_argument('--extract_feature', action='store_true', help='extract object feature')
     args = parser.parse_args()
     print(args)
 

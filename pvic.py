@@ -567,11 +567,11 @@ class PViC(nn.Module):
         )
         print("region_props[0]['labels']: ", region_props[0]['labels'])
         print("region_props[0]['scores']: ", region_props[0]['scores'])
-        print("region_props[1]['labels']: ", region_props[1]['labels'])
-        print("region_props[1]['scores']: ", region_props[1]['scores'])
+        # print("region_props[1]['labels']: ", region_props[1]['labels'])
+        # print("region_props[1]['scores']: ", region_props[1]['scores'])
         print("region_props[0]['hidden_states'].shape: ", region_props[0]['hidden_states'].shape)
-        region_props[0]['hidden_states'][3] = region_props[1]['hidden_states'][3]
-        region_props = region_props[:1]
+        # region_props[0]['hidden_states'][3] = region_props[1]['hidden_states'][3]
+        # region_props = region_props[:1]
         boxes = [r['boxes'] for r in region_props]
         # Produce human-object pairs.
         (
@@ -612,6 +612,195 @@ class PViC(nn.Module):
             logits[-1], prior_scores, image_sizes
         )
         return detections
+
+class Detector(nn.Module):
+    """detr"""
+
+    def __init__(self,
+        detector: Tuple[nn.Module, str], postprocessor: nn.Module, human_idx: int = 0,
+        # Sampling hyper-parameters
+        box_score_thresh: float = .05,
+        min_instances: int = 3,
+        max_instances: int = 15,
+    ) -> None:
+        super().__init__()
+
+        self.detector = detector[0]
+        self.od_forward = {
+            "base": self.base_forward,
+            "advanced": self.advanced_forward,
+        }[detector[1]]
+        self.postprocessor = postprocessor
+        self.human_idx = human_idx
+        self.box_score_thresh = box_score_thresh
+        self.min_instances = min_instances
+        self.max_instances = max_instances
+
+    def freeze_detector(self):
+        for p in self.detector.parameters():
+            p.requires_grad = False
+
+    @staticmethod
+    def base_forward(ctx, samples: NestedTensor):
+        if isinstance(samples, (list, torch.Tensor)):
+            samples = nested_tensor_from_tensor_list(samples)
+        features, pos = ctx.backbone(samples)
+
+        src, mask = features[-1].decompose()
+        assert mask is not None
+        hs = ctx.transformer(ctx.input_proj(src), mask, ctx.query_embed.weight, pos[-1])[0]
+
+        outputs_class = ctx.class_embed(hs)
+        outputs_coord = ctx.bbox_embed(hs).sigmoid()
+        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+        return out, hs, features
+
+    @staticmethod
+    def advanced_forward(ctx, samples: NestedTensor):
+        if not isinstance(samples, NestedTensor):
+            samples = nested_tensor_from_tensor_list(samples)
+        features, pos = ctx.backbone(samples)
+
+        srcs = []
+        masks = []
+        for l, feat in enumerate(features):
+            src, mask = feat.decompose()
+            srcs.append(ctx.input_proj[l](src))
+            masks.append(mask)
+            assert mask is not None
+        if ctx.num_feature_levels > len(srcs):
+            _len_srcs = len(srcs)
+            for l in range(_len_srcs, ctx.num_feature_levels):
+                if l == _len_srcs:
+                    src = ctx.input_proj[l](features[-1].tensors)
+                else:
+                    src = ctx.input_proj[l](srcs[-1])
+                m = samples.mask
+                mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(
+                    torch.bool
+                )[0]
+                pos_l = ctx.backbone[1](NestedTensor(src, mask)).to(src.dtype)
+                srcs.append(src)
+                masks.append(mask)
+                pos.append(pos_l)
+
+        query_embeds = None
+        if not ctx.two_stage or ctx.mixed_selection:
+            query_embeds = ctx.query_embed.weight[0 : ctx.num_queries, :]
+
+        self_attn_mask = (
+            torch.zeros([ctx.num_queries, ctx.num_queries,]).bool().to(src.device)
+        )
+        self_attn_mask[ctx.num_queries_one2one :, 0 : ctx.num_queries_one2one,] = True
+        self_attn_mask[0 : ctx.num_queries_one2one, ctx.num_queries_one2one :,] = True
+
+        (
+            hs,
+            init_reference,
+            inter_references,
+            enc_outputs_class,
+            enc_outputs_coord_unact,
+        ) = ctx.transformer(srcs, masks, pos, query_embeds, self_attn_mask)
+
+        outputs_classes_one2one = []
+        outputs_coords_one2one = []
+        outputs_classes_one2many = []
+        outputs_coords_one2many = []
+        for lvl in range(hs.shape[0]):
+            if lvl == 0:
+                reference = init_reference
+            else:
+                reference = inter_references[lvl - 1]
+            reference = inverse_sigmoid(reference)
+            outputs_class = ctx.class_embed[lvl](hs[lvl])
+            tmp = ctx.bbox_embed[lvl](hs[lvl])
+            if reference.shape[-1] == 4:
+                tmp += reference
+            else:
+                assert reference.shape[-1] == 2
+                tmp[..., :2] += reference
+            outputs_coord = tmp.sigmoid()
+
+            outputs_classes_one2one.append(outputs_class[:, 0 : ctx.num_queries_one2one])
+            outputs_classes_one2many.append(outputs_class[:, ctx.num_queries_one2one :])
+            outputs_coords_one2one.append(outputs_coord[:, 0 : ctx.num_queries_one2one])
+            outputs_coords_one2many.append(outputs_coord[:, ctx.num_queries_one2one :])
+        outputs_classes_one2one = torch.stack(outputs_classes_one2one)
+        outputs_coords_one2one = torch.stack(outputs_coords_one2one)
+        outputs_classes_one2many = torch.stack(outputs_classes_one2many)
+        outputs_coords_one2many = torch.stack(outputs_coords_one2many)
+
+        out = {
+            "pred_logits": outputs_classes_one2one[-1],
+            "pred_boxes": outputs_coords_one2one[-1],
+            "pred_logits_one2many": outputs_classes_one2many[-1],
+            "pred_boxes_one2many": outputs_coords_one2many[-1],
+        }
+
+        if ctx.two_stage:
+            enc_outputs_coord = enc_outputs_coord_unact.sigmoid()
+            out["enc_outputs"] = {
+                "pred_logits": enc_outputs_class,
+                "pred_boxes": enc_outputs_coord,
+            }
+        return out, hs, features
+
+    def forward(self,
+        images: List[Tensor],
+        targets: Optional[List[dict]] = None
+    ) -> List[dict]:
+        """
+        Parameters:
+        -----------
+        images: List[Tensor]
+            Input images in format (C, H, W)
+        targets: List[dict], optional
+            Human-object interaction targets
+
+        Returns:
+        --------
+        results: List[dict]
+            Detected human-object interactions. Each dict has the following keys:
+            `boxes`: torch.Tensor
+                (N, 4) Bounding boxes for detected human and object instances
+            `pairing`: torch.Tensor
+                (M, 2) Pairing indices, with human instance preceding the object instance
+            `scores`: torch.Tensor
+                (M,) Interaction score for each pair
+            `labels`: torch.Tensor
+                (M,) Predicted action class for each pair
+            `objects`: torch.Tensor
+                (M,) Predicted object class for each pair
+            `size`: torch.Tensor
+                (2,) Image height and width
+            `x`: torch.Tensor
+                (M,) Index tensor corresponding to the duplications of human-objet pairs. Each
+                pair was duplicated once for each valid action.
+        """
+        if self.training and targets is None:
+            raise ValueError("In training mode, targets should be passed")
+        image_sizes = torch.as_tensor([im.size()[-2:] for im in images], device=images[0].device)
+
+        with torch.no_grad():
+            results, hs, features = self.od_forward(self.detector, images)
+            results = self.postprocessor(results, image_sizes)
+
+        region_props = prepare_region_proposals(
+            results, hs[-1], image_sizes,
+            box_score_thresh=self.box_score_thresh,
+            human_idx=self.human_idx,
+            min_instances=self.min_instances,
+            max_instances=self.max_instances
+        )
+        # print("region_props[0]['labels']: ", region_props[0]['labels'])
+        # print("region_props[0]['scores']: ", region_props[0]['scores'])
+        # print("region_props[1]['labels']: ", region_props[1]['labels'])
+        # print("region_props[1]['scores']: ", region_props[1]['scores'])
+        # print("region_props[0]['hidden_states'].shape: ", region_props[0]['hidden_states'].shape)
+        # region_props[0]['hidden_states'][3] = region_props[1]['hidden_states'][3]
+        # region_props = region_props[:1]
+        # boxes = [r['boxes'] for r in region_props]
+        return region_props
 
 class PViC_CLIP(nn.Module):
     """Two-stage HOI detector with enhanced visual context"""
@@ -1044,6 +1233,14 @@ def build_detector(args, obj_to_verb):
         else:
             print(f"Load weights for the object detector from {args.pretrained}")
         detr.load_state_dict(torch.load(args.pretrained, map_location='cpu')['model_state_dict'])
+    if args.extract_feature:
+        model = Detector(
+            (detr, args.detector), postprocessors['bbox'],
+            box_score_thresh=args.box_score_thresh,
+            min_instances=args.min_instances,
+            max_instances=args.max_instances,       
+        )
+        return model
     if args.CLIP_encoder:
         ho_matcher = HumanObjectMatcher_CLIP(
             repr_size=args.repr_dim,

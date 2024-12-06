@@ -242,7 +242,7 @@ if __name__ == "__main__":
         help="Threshold on action classes.")
     parser.add_argument('--image-path', default=None, type=str,
         help="Path to an image file.")
-    
+    parser.add_argument('--extract_feature', action='store_true', help='extract object feature')
     args = parser.parse_args()
 
     main(args)
