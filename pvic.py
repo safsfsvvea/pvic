@@ -11,6 +11,7 @@ import os
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
+import random
 
 from torch import nn, Tensor
 from collections import OrderedDict
@@ -321,6 +322,51 @@ def inverse_sigmoid(x, eps=1e-5):
     x2 = (1 - x).clamp(min=eps)
     return torch.log(x1 / x2)
 
+# def replace_features_with_probability(region_props, feature_dir, replacement_prob=0.5, replacement_thresh=0.9):
+#     """
+#     Randomly replace `hidden_states` features in `region_props` that meet certain conditions.
+    
+#     Args:
+#         region_props (list): A list of region proposals for each image, containing `labels`, `scores`, and `hidden_states`.
+#         feature_dir (str): Directory where feature files are stored. Each class should have a feature file named `{label}_features.npy`.
+#         replacement_prob (float): Probability of replacement, in the range [0, 1].
+#         replacement_thresh (float): Score threshold for considering a feature for replacement.
+    
+#     Returns:
+#         list: The modified `region_props` with potentially replaced `hidden_states`.
+#     """
+#     for i, props in enumerate(region_props):
+#         labels = props['labels']  # shape: (N,)
+#         scores = props['scores']  # shape: (N,)
+#         hidden_states = props['hidden_states']  # shape: (N, D)
+
+#         valid_indices = (labels != 0) & (scores > replacement_thresh)
+#         valid_labels = labels[valid_indices]
+#         valid_indices = torch.nonzero(valid_indices).squeeze(1)
+
+#         for idx in valid_indices:
+#             label = int(labels[idx].item())
+#             feature_file = f"{feature_dir}/{label}_features.npy"
+
+#             if not os.path.exists(feature_file):
+#                 continue
+
+#             feature_pool = np.load(feature_file)  # shape: (M, D)
+#             if feature_pool.shape[0] == 0:
+#                 continue
+
+#             if random.random() < replacement_prob:
+#                 random_feature = random.choice(feature_pool)
+#                 hidden_states[idx] = torch.tensor(random_feature, dtype=hidden_states.dtype, device=hidden_states.device)
+
+#         props['hidden_states'] = hidden_states
+
+#     return region_props
+
+
+
+
+
 class PViC(nn.Module):
     """Two-stage HOI detector with enhanced visual context"""
 
@@ -336,10 +382,15 @@ class PViC(nn.Module):
         min_instances: int = 3,
         max_instances: int = 15,
         raw_lambda: float = 2.8,
+        args=None,
     ) -> None:
         super().__init__()
 
         self.detector = detector[0]
+        self.object_feature_replace_prob = args.object_feature_replace_prob
+        self.object_feature_replace_thresh = args.object_feature_replace_thresh
+        # self.object_feature_dir = args.object_feature_dir
+        self.feature_memory = self.load_features_to_memory(args.object_feature_dir)
         self.od_forward = {
             "base": self.base_forward,
             "advanced": self.advanced_forward,
@@ -361,6 +412,65 @@ class PViC(nn.Module):
         self.min_instances = min_instances
         self.max_instances = max_instances
         self.raw_lambda = raw_lambda
+
+    def load_features_to_memory(self, feature_dir, num_classes=80):
+        """
+        Load all object features into memory before training starts.
+        
+        Args:
+            feature_dir (str): Directory containing the feature files.
+            num_classes (int): Number of classes to load (1 to num_classes-1).
+        
+        Returns:
+            dict: A dictionary mapping class labels to their feature arrays.
+        """
+        feature_memory = {}
+        for label in range(1, num_classes):
+            feature_file = os.path.join(feature_dir, f"{label}_features.npy")
+            if os.path.exists(feature_file):
+                feature_memory[label] = np.load(feature_file)
+            else:
+                feature_memory[label] = np.empty((0,))
+        return feature_memory
+    def replace_features_with_probability(self, region_props, feature_memory, replacement_prob=0.5, replacement_thresh=0.9):
+        """
+        Randomly replace `hidden_states` features in `region_props` that meet certain conditions,
+        using features loaded in memory.
+
+        Args:
+            region_props (list): A list of region proposals for each image, containing `labels`, `scores`, and `hidden_states`.
+            feature_memory (dict): A dictionary where keys are labels and values are feature arrays loaded in memory.
+            replacement_prob (float): Probability of replacement, in the range [0, 1].
+            replacement_thresh (float): Score threshold for considering a feature for replacement.
+        
+        Returns:
+            list: The modified `region_props` with potentially replaced `hidden_states`.
+        """
+        for props in region_props:
+            labels = props['labels']  # shape: (N,)
+            scores = props['scores']  # shape: (N,)
+            hidden_states = props['hidden_states']  # shape: (N, D)
+
+            # Find valid indices where labels != 0 and scores > replacement_thresh
+            valid_indices = (labels != 0) & (scores > replacement_thresh)
+            indices = torch.nonzero(valid_indices).squeeze(1)
+
+            if len(indices) > 0:
+                # Random replacement mask
+                replace_mask = np.random.rand(len(indices)) < replacement_prob
+
+                # Batch operation for replacing features
+                replace_indices = indices[replace_mask]
+                for idx in replace_indices:
+                    label = int(labels[idx].item())
+                    if label in feature_memory and feature_memory[label].shape[0] > 0:
+                        random_index = np.random.randint(0, feature_memory[label].shape[0])
+                        random_feature = feature_memory[label][random_index]
+                        hidden_states[idx] = torch.tensor(random_feature, dtype=hidden_states.dtype, device=hidden_states.device)
+
+            props['hidden_states'] = hidden_states
+
+        return region_props
 
     def freeze_detector(self):
         for p in self.detector.parameters():
@@ -565,13 +675,15 @@ class PViC(nn.Module):
             min_instances=self.min_instances,
             max_instances=self.max_instances
         )
-        print("region_props[0]['labels']: ", region_props[0]['labels'])
-        print("region_props[0]['scores']: ", region_props[0]['scores'])
+        # print("region_props[0]['labels']: ", region_props[0]['labels'])
+        # print("region_props[0]['scores']: ", region_props[0]['scores'])
         # print("region_props[1]['labels']: ", region_props[1]['labels'])
         # print("region_props[1]['scores']: ", region_props[1]['scores'])
-        print("region_props[0]['hidden_states'].shape: ", region_props[0]['hidden_states'].shape)
+        # print("region_props[0]['hidden_states'].shape: ", region_props[0]['hidden_states'].shape)
         # region_props[0]['hidden_states'][3] = region_props[1]['hidden_states'][3]
         # region_props = region_props[:1]
+        if self.object_feature_replace_prob > 0 and self.training:
+            region_props = self.replace_features_with_probability(region_props, self.feature_memory, self.object_feature_replace_prob, self.object_feature_replace_thresh)
         boxes = [r['boxes'] for r in region_props]
         # Produce human-object pairs.
         (
@@ -1318,5 +1430,6 @@ def build_detector(args, obj_to_verb):
             min_instances=args.min_instances,
             max_instances=args.max_instances,
             raw_lambda=args.raw_lambda,
+            args=args,
         )
     return model
