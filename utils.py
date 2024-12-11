@@ -229,15 +229,15 @@ class CustomisedDLE(DistributedLearningEngine):
 
     def _on_start(self):
         if self._train_loader.dataset.name == "hicodet":
-            ap = self.test_hico()
+            ap, max_recall = self.test_hico()
             if self._rank == 0:
                 # Fetch indices for rare and non-rare classes
                 rare = self.test_dataloader.dataset.dataset.rare
                 non_rare = self.test_dataloader.dataset.dataset.non_rare
-                perf = [ap.mean().item(), ap[rare].mean().item(), ap[non_rare].mean().item()]
+                perf = [ap.mean().item(), ap[rare].mean().item(), ap[non_rare].mean().item(), max_recall.mean().item()]
                 print(
                     f"Epoch {self._state.epoch} =>\t"
-                    f"mAP: {perf[0]:.4f}, rare: {perf[1]:.4f}, none-rare: {perf[2]:.4f}."
+                    f"mAP: {perf[0]:.4f}, rare: {perf[1]:.4f}, none-rare: {perf[2]:.4f}, mean max recall: {perf[3]:.4f}."
                 )
                 self.best_perf = perf[0]
                 wandb.init(config=self.config)
@@ -314,19 +314,19 @@ class CustomisedDLE(DistributedLearningEngine):
 
     def _on_end_epoch(self):
         if self._train_loader.dataset.name == "hicodet":
-            ap = self.test_hico()
+            ap, max_recall = self.test_hico()
             if self._rank == 0:
                 # Fetch indices for rare and non-rare classes
                 rare = self.test_dataloader.dataset.dataset.rare
                 non_rare = self.test_dataloader.dataset.dataset.non_rare
-                perf = [ap.mean().item(), ap[rare].mean().item(), ap[non_rare].mean().item()]
+                perf = [ap.mean().item(), ap[rare].mean().item(), ap[non_rare].mean().item(), max_recall.mean().item()]
                 print(
                     f"Epoch {self._state.epoch} =>\t"
-                    f"mAP: {perf[0]:.4f}, rare: {perf[1]:.4f}, none-rare: {perf[2]:.4f}."
+                    f"mAP: {perf[0]:.4f}, rare: {perf[1]:.4f}, none-rare: {perf[2]:.4f}, mean max recall: {perf[3]:.4f}."
                 )
                 wandb.log({
                     "epochs": self._state.epoch, "mAP full": perf[0],
-                    "mAP rare": perf[1], "mAP non_rare": perf[2]
+                    "mAP rare": perf[1], "mAP non_rare": perf[2], "mean max recall": perf[2]
                 })
         else:
             ap = self.test_vcoco()
@@ -373,7 +373,7 @@ class CustomisedDLE(DistributedLearningEngine):
         if self._rank == 0:
             meter = DetectionAPMeter(
                 600, nproc=1, algorithm='11P',
-                num_gt=dataset.anno_interaction,
+                num_gt=dataset.anno_interaction, args=self.config
             )
         for batch in tqdm(dataloader, disable=(self._world_size != 1)):
             # print("batch[:-1]: ", batch[:-1])

@@ -322,51 +322,6 @@ def inverse_sigmoid(x, eps=1e-5):
     x2 = (1 - x).clamp(min=eps)
     return torch.log(x1 / x2)
 
-# def replace_features_with_probability(region_props, feature_dir, replacement_prob=0.5, replacement_thresh=0.9):
-#     """
-#     Randomly replace `hidden_states` features in `region_props` that meet certain conditions.
-    
-#     Args:
-#         region_props (list): A list of region proposals for each image, containing `labels`, `scores`, and `hidden_states`.
-#         feature_dir (str): Directory where feature files are stored. Each class should have a feature file named `{label}_features.npy`.
-#         replacement_prob (float): Probability of replacement, in the range [0, 1].
-#         replacement_thresh (float): Score threshold for considering a feature for replacement.
-    
-#     Returns:
-#         list: The modified `region_props` with potentially replaced `hidden_states`.
-#     """
-#     for i, props in enumerate(region_props):
-#         labels = props['labels']  # shape: (N,)
-#         scores = props['scores']  # shape: (N,)
-#         hidden_states = props['hidden_states']  # shape: (N, D)
-
-#         valid_indices = (labels != 0) & (scores > replacement_thresh)
-#         valid_labels = labels[valid_indices]
-#         valid_indices = torch.nonzero(valid_indices).squeeze(1)
-
-#         for idx in valid_indices:
-#             label = int(labels[idx].item())
-#             feature_file = f"{feature_dir}/{label}_features.npy"
-
-#             if not os.path.exists(feature_file):
-#                 continue
-
-#             feature_pool = np.load(feature_file)  # shape: (M, D)
-#             if feature_pool.shape[0] == 0:
-#                 continue
-
-#             if random.random() < replacement_prob:
-#                 random_feature = random.choice(feature_pool)
-#                 hidden_states[idx] = torch.tensor(random_feature, dtype=hidden_states.dtype, device=hidden_states.device)
-
-#         props['hidden_states'] = hidden_states
-
-#     return region_props
-
-
-
-
-
 class PViC(nn.Module):
     """Two-stage HOI detector with enhanced visual context"""
 

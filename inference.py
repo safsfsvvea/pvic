@@ -243,6 +243,9 @@ if __name__ == "__main__":
     parser.add_argument('--image-path', default=None, type=str,
         help="Path to an image file.")
     parser.add_argument('--extract_feature', action='store_true', help='extract object feature')
+    parser.add_argument('--object_feature_replace_prob', default=0, type=float, help='probability of replacing object query')
+    parser.add_argument('--object_feature_replace_thresh', default=.9, type=float, help='score threshold of replacing object query')
+    parser.add_argument('--object_feature_dir', default='/bd_byt4090i1/users/clin/pvic/object_features/features')
     args = parser.parse_args()
 
     main(args)

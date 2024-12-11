@@ -23,6 +23,7 @@ from pvic import build_detector
 from utils import custom_collate, CustomisedDLE, DataFactory, DataFactory_CLIP
 from configs import base_detector_args, advanced_detector_args
 import ModifiedCLIP as clip
+import time
 
 warnings.filterwarnings("ignore")
 
@@ -120,7 +121,7 @@ def main(rank, args):
                 print(f"The mAP is {ap.mean():.4f}.")
             return
         else:
-            ap = engine.test_hico()
+            ap, max_recall = engine.test_hico()
             if rank == 0:
                 # Fetch indices for rare and non-rare classes
                 rare = trainset.dataset.rare
@@ -128,7 +129,8 @@ def main(rank, args):
                 print(
                     f"The mAP is {ap.mean():.4f},"
                     f" rare: {ap[rare].mean():.4f},"
-                    f" none-rare: {ap[non_rare].mean():.4f}"
+                    f" none-rare: {ap[non_rare].mean():.4f},"
+                    f" mean max recall: {max_recall.mean():.4f}"
                 )
             return
 
@@ -189,7 +191,7 @@ if __name__ == '__main__':
     parser.add_argument('--max-instances', default=15, type=int)
 
     parser.add_argument('--resume', default='', help='Resume from a model')
-    parser.add_argument('--use-wandb', default=False, action='store_true')
+    parser.add_argument('--use-wandb', default=True, action='store_true')
 
     parser.add_argument('--port', default='1234', type=str)
     parser.add_argument('--seed', default=140, type=int)
@@ -198,9 +200,10 @@ if __name__ == '__main__':
     parser.add_argument('--cache', action='store_true')
     parser.add_argument('--sanity', action='store_true')
     parser.add_argument('--extract_feature', action='store_true', help='extract object feature')
-    parser.add_argument('--object_feature_replace_prob', default=.5, type=float, help='probability of replacing object query')
+    parser.add_argument('--object_feature_replace_prob', default=0, type=float, help='probability of replacing object query')
     parser.add_argument('--object_feature_replace_thresh', default=.9, type=float, help='score threshold of replacing object query')
     parser.add_argument('--object_feature_dir', default='/bd_byt4090i1/users/clin/pvic/object_features/features')
+    parser.add_argument('--test_out_dir', default='')
     args = parser.parse_args()
     print(args)
 
@@ -213,5 +216,7 @@ if __name__ == '__main__':
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = args.port
     # os.environ["MASTER_PORT"] = "12345"
-
+    start_time = time.time()
     mp.spawn(main, nprocs=args.world_size, args=(args,))
+    end_time = time.time()
+    print(f"Total main time: {end_time - start_time:.2f} seconds.")
