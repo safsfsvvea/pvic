@@ -1,0 +1,22 @@
+__pycache__
+
+# Dataset
+hico_20160224_det
+
+# Visualised results
+visualisations
+*.html
+
+# Checkpoints
+checkpoints
+
+# Detections
+detections/train*
+detections/test*
+
+internimage/
+internimage_backbone_freeze_finetune/
+internimage_backbone_freeze_finetune_nms/
+
+# MacOS
+.DS_Store
