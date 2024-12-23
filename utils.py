@@ -125,18 +125,24 @@ class DataFactory_CLIP(Dataset):
         return image, target
 
 class DataFactory(Dataset):
-    def __init__(self, name, partition, data_root):
+    def __init__(self, name, partition, data_root, args=None):
+        self.extract_feature = None
+        if args is not None:
+            self.extract_feature = args.extract_feature
         if name not in ['hicodet', 'vcoco']:
             raise ValueError("Unknown dataset ", name)
 
         if name == 'hicodet':
             assert partition in ['train2015', 'test2015'], \
                 "Unknown HICO-DET partition " + partition
+            if self.extract_feature:
+                partition = 'train2015'
             self.dataset = HICODet(
                 root=os.path.join(data_root, "hico_20160224_det/images", partition),
                 anno_file=os.path.join(data_root, f"instances_{partition}.json"),
                 target_transform=pocket.ops.ToTensor(input_format='dict')
             )
+            partition = 'test2015'
         else:
             assert partition in ['train', 'val', 'trainval', 'test'], \
                 "Unknown V-COCO partition " + partition
@@ -229,8 +235,9 @@ class CustomisedDLE(DistributedLearningEngine):
 
     def _on_start(self):
         if self._train_loader.dataset.name == "hicodet":
-            ap, max_recall = self.test_hico()
+            result = self.test_hico()
             if self._rank == 0:
+                ap, max_recall = result 
                 # Fetch indices for rare and non-rare classes
                 rare = self.test_dataloader.dataset.dataset.rare
                 non_rare = self.test_dataloader.dataset.dataset.non_rare
@@ -314,8 +321,9 @@ class CustomisedDLE(DistributedLearningEngine):
 
     def _on_end_epoch(self):
         if self._train_loader.dataset.name == "hicodet":
-            ap, max_recall = self.test_hico()
+            result = self.test_hico()
             if self._rank == 0:
+                ap, max_recall = result
                 # Fetch indices for rare and non-rare classes
                 rare = self.test_dataloader.dataset.dataset.rare
                 non_rare = self.test_dataloader.dataset.dataset.non_rare
@@ -434,8 +442,8 @@ class CustomisedDLE(DistributedLearningEngine):
                 meter.append(torch.cat(scores_ddp), torch.cat(preds_ddp), torch.cat(labels_ddp))
 
         if self._rank == 0:
-            ap = meter.eval()
-            return ap
+            ap, max_rec = meter.eval()
+            return ap, max_rec
         else:
             return -1
 

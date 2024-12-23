@@ -120,6 +120,11 @@ def main(args):
         args.clip_model.eval()
         dataset = DataFactory_CLIP(name=args.dataset, partition=args.partition, data_root=args.data_root, args=args)
     else:
+        if args.CLIP_query: 
+            args.clip_model, args.clip_preprocess = clip.load(args.CLIP_path, device="cpu")
+        for param in args.clip_model.parameters():
+            param.requires_grad = False
+        args.clip_model.eval()
         dataset = DataFactory(name=args.dataset, partition=args.partition, data_root=args.data_root)
     conversion = dataset.dataset.object_to_verb if args.dataset == 'hicodet' \
         else list(dataset.dataset.object_to_action.values())
@@ -220,7 +225,8 @@ if __name__ == "__main__":
     parser.add_argument('--CLIP_encoder', action='store_true', help='use CLIP feature in encoder stage')
     parser.add_argument('--CLIP_decoder', action='store_true', help='use CLIP feature in decoder stage')
     parser.add_argument('--clip4hoi_decoder', action='store_true', help='use clip4hoi decoder')
-    parser.add_argument('--CLIP_path', type=str)
+    parser.add_argument('--CLIP_path', default='checkpoints/pvic-detr-r50-hicodet.pth', type=str)
+    parser.add_argument('--CLIP_query', action='store_true', help='use CLIP bbox feature and fusion with detr queries')
     parser.add_argument('--kv-src', default='C5', type=str, choices=['C5', 'C4', 'C3'])
     parser.add_argument('--repr-dim', default=384, type=int)
     parser.add_argument('--triplet-enc-layers', default=1, type=int)
@@ -246,6 +252,7 @@ if __name__ == "__main__":
     parser.add_argument('--object_feature_replace_prob', default=0, type=float, help='probability of replacing object query')
     parser.add_argument('--object_feature_replace_thresh', default=.9, type=float, help='score threshold of replacing object query')
     parser.add_argument('--object_feature_dir', default='/bd_byt4090i1/users/clin/pvic/object_features/features')
+    parser.add_argument('--same_object_verb', action='store_true', help='replace object query when object and verb category are exactly the same')
     args = parser.parse_args()
 
     main(args)

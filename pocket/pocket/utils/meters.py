@@ -641,29 +641,31 @@ class DetectionAPMeter:
         self.ap, self.max_rec = self.compute_ap(self._output, self._labels, self.num_gt,
             nproc=self._nproc, algorithm=self.algorithm)
         
-        if not os.path.exists(self.test_out_dir):
-            os.makedirs(self.test_out_dir)
-            
-        self.results_df = pd.DataFrame({
-            'Class': [f'Class {i}' for i in range(len(self.ap))],
-            'AP': self.ap.cpu().numpy(),  # Convert to numpy for easier handling in pandas
-            'Max Recall': self.max_rec.cpu().numpy()
-        })
-        csv_path = os.path.join(self.test_out_dir, 'hoi_class_results.csv')
-        # Save results to CSV file
-        self.results_df.to_csv(csv_path, index=False)
-        print(f"Results saved to '{csv_path}'")
+        if self.test_out_dir:
+            if not os.path.exists(self.test_out_dir):
+                os.makedirs(self.test_out_dir)
+                
+            self.results_df = pd.DataFrame({
+                'Class': [f'Class {i}' for i in range(len(self.ap))],
+                'AP': self.ap.cpu().numpy(),  # Convert to numpy for easier handling in pandas
+                'Max Recall': self.max_rec.cpu().numpy()
+            })
         
-        json_path = os.path.join(self.test_out_dir, 'hoi_class_results.json')
-        results_dict = {
-            'Class': [f'Class {i}' for i in range(len(self.ap))],
-            'AP': self.ap.cpu().numpy().tolist(),  # Convert to list for easy storage in JSON
-            'Max Recall': self.max_rec.cpu().numpy().tolist()
-        }
+            csv_path = os.path.join(self.test_out_dir, 'hoi_class_results.csv')
+            # Save results to CSV file
+            self.results_df.to_csv(csv_path, index=False)
+            print(f"Results saved to '{csv_path}'")
+            
+            json_path = os.path.join(self.test_out_dir, 'hoi_class_results.json')
+            results_dict = {
+                'Class': [f'Class {i}' for i in range(len(self.ap))],
+                'AP': self.ap.cpu().numpy().tolist(),  # Convert to list for easy storage in JSON
+                'Max Recall': self.max_rec.cpu().numpy().tolist()
+            }
 
-        # Save results to a JSON file
-        with open(json_path, 'w') as f:
-            json.dump(results_dict, f, indent=4)
-        print(f"Results saved to '{json_path}'")
+            # Save results to a JSON file
+            with open(json_path, 'w') as f:
+                json.dump(results_dict, f, indent=4)
+            print(f"Results saved to '{json_path}'")
         
         return self.ap, self.max_rec
