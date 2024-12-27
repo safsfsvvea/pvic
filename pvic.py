@@ -10,12 +10,13 @@ Microsoft Research Asia
 import os
 import torch
 import torch.nn.functional as F
+import torchvision.transforms as T
 import torch.distributed as dist
 
 from torch import nn, Tensor
 from collections import OrderedDict
 from typing import Optional, Tuple, List
-from torchvision.ops import FeaturePyramidNetwork
+from torchvision.ops import FeaturePyramidNetwork, roi_align
 
 from transformers import (
     TransformerEncoder,
@@ -637,6 +638,7 @@ class PViC_CLIP(nn.Module):
         self.decoder = triplet_decoder
         self.clip4hoi_decoder = clip4hoi_decoder
         self.clip_model = clip_model
+        self.CLIP_query = args.CLIP_query
         self.CLIP_text = args.CLIP_text
         self.CLIP_encoder = args.CLIP_encoder
         self.CLIP_decoder = args.CLIP_decoder
@@ -654,6 +656,9 @@ class PViC_CLIP(nn.Module):
         else:
             self.binary_classifier = nn.Linear(768, num_verbs)
 
+        if self.CLIP_query:
+            self.mmf = MultiModalFusion(256, 512, 256)
+        
         self.repr_size = repr_size
         self.human_idx = human_idx
         self.num_verbs = num_verbs
@@ -869,27 +874,23 @@ class PViC_CLIP(nn.Module):
                 (M,) Index tensor corresponding to the duplications of human-objet pairs. Each
                 pair was duplicated once for each valid action.
         """
-        # print("targets: ", targets)
         if self.training and targets is None:
             raise ValueError("In training mode, targets should be passed")
         image_sizes = torch.as_tensor([im.size()[-2:] for im in images], device=images[0].device)
-        # print("images[0].dtype: ", images[0].dtype)
         clip_input = torch.stack([v['clip_inputs'] for v in targets]).to(images[0].device)
-        # print("clip_input.device: ", clip_input.device)
+        nest_tensor = nested_tensor_from_tensor_list(images)
         with torch.no_grad():
-            results, hs, features = self.od_forward(self.detector, images)
+            # results, hs, features = self.od_forward(self.detector, images)
+            results, hs, features = self.od_forward(self.detector, nest_tensor)
             results = self.postprocessor(results, image_sizes)
-            clip_cls, clip_visual_ori = self.clip_model.encode_image(clip_input)
-        clip_visual_ori = clip_visual_ori.to(self.CLIPFeatureProjector.weight.dtype)
-            # print("clip_visual_ori.shape: ", clip_visual_ori.shape)
-        # print("clip_cls.shape: ", clip_cls.shape)
-        # similarity_matrix_image = F.cosine_similarity(clip_cls.unsqueeze(1), self.clip_text_feature.unsqueeze(0), dim=-1)
-        # topk_values_image, topk_indices_image = torch.topk(similarity_matrix_image, k=5, dim=-1)
-        # print("Top 5 values:", topk_values_image)
-        # print("Top 5 indices:", topk_indices_image)
         
-        clip_visual = self.CLIPFeatureProjector(clip_visual_ori)
-        # print("clip_visual: ", clip_visual.shape)
+        
+        if self.CLIP_encoder or self.CLIP_decoder:
+            with torch.no_grad():
+                clip_cls, clip_visual_ori = self.clip_model.encode_image(clip_input)
+            clip_visual_ori = clip_visual_ori.to(self.CLIPFeatureProjector.weight.dtype)
+            clip_visual = self.CLIPFeatureProjector(clip_visual_ori)
+            
         region_props = prepare_region_proposals(
             results, hs[-1], image_sizes,
             box_score_thresh=self.box_score_thresh,
@@ -898,6 +899,25 @@ class PViC_CLIP(nn.Module):
             max_instances=self.max_instances
         )
         boxes = [r['boxes'] for r in region_props]
+        if self.CLIP_query:
+            boxes_lengths = [r['boxes'].shape[0] for r in region_props]
+            # print("boxes: ", boxes)
+            clip_input_query = roi_align(nest_tensor.tensors, boxes, (224, 224))
+            clip_transforms = T.Compose([
+                T.Normalize(mean=[-m / s for m, s in zip([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])],
+                            std=[1 / s for s in [0.229, 0.224, 0.225]]),
+                T.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))
+            ])
+            clip_input_query = clip_transforms(clip_input_query)
+            with torch.no_grad():
+                clip_cls_query, _ = self.clip_model.encode_image(clip_input_query)
+            hidden_states_list = [r['hidden_states'] for r in region_props]
+            merged_hidden_states = torch.cat(hidden_states_list, dim=0)
+            clip_cls_query = clip_cls_query.to(merged_hidden_states.dtype)
+            fused_hidden_states = self.mmf(merged_hidden_states, clip_cls_query)
+            split_hidden_states = torch.split(fused_hidden_states, boxes_lengths)
+            for i, r in enumerate(region_props):
+                r['hidden_states'] = split_hidden_states[i]    
         # Produce human-object pairs.
         if self.CLIP_encoder:
             (
@@ -912,21 +932,17 @@ class PViC_CLIP(nn.Module):
                 object_types, positional_embeds
             ) = self.ho_matcher(region_props, image_sizes)
         # Compute keys/values for triplet decoder.
-        # print("features len: ", len(features))
-        # print("features[0].tensors.shape: ", features[0].tensors.shape)
         memory, mask = self.feature_head(features)
         b, h, w, c = memory.shape
-        # print("memory.shape: ", memory.shape)
-        # print("self.CLIPFeatureProjector.weight.dtype: ", self.CLIPFeatureProjector.weight.dtype)  # 查看类型
-        # print("clip_visual.dtype: ", clip_visual.dtype)  # 查看类型
-        # print("memory.dtype: ", memory.dtype)
-        
-        B, L, C = clip_visual.shape
-        mask_clip = torch.zeros(B, 1, L, dtype=torch.bool, device=images[0].device)
+                
         memory = memory.reshape(b, h * w, c)
         kv_p_m = mask.reshape(-1, 1, h * w)
         k_pos = self.kv_pe(NestedTensor(memory, mask)).permute(0, 2, 3, 1).reshape(b, h * w, 1, c)
-        k_pos_clip = self.kv_pe(NestedTensor(clip_visual, mask_clip)).permute(0, 2, 3, 1).reshape(B, L, 1, C)
+        
+        if self.CLIP_encoder or self.CLIP_decoder:
+            B, L, C = clip_visual.shape
+            mask_clip = torch.zeros(B, 1, L, dtype=torch.bool, device=images[0].device)
+            k_pos_clip = self.kv_pe(NestedTensor(clip_visual, mask_clip)).permute(0, 2, 3, 1).reshape(B, L, 1, C)
         # Enhance visual context with triplet decoder.
         query_embeds = []
         if self.CLIP_decoder:
@@ -958,26 +974,15 @@ class PViC_CLIP(nn.Module):
                     clip_vis[0:1].unsqueeze(1)
                 ).squeeze(dim=2))
             query_embeds = final_query_embeds
-            # final_query_embeds = torch.cat(final_query_embeds, dim=1)
-            # print("final_query_embeds shape: ", final_query_embeds.shape)
+
         # Concatenate queries from all images in the same batch.
         query_embeds = torch.cat(query_embeds, dim=1)   # (ndec, \sigma{n}, q_dim)
-        # print("query_embeds shape: ", query_embeds.shape)
+
         if self.CLIP_text:
             query_embeds_flat = query_embeds.view(-1, query_embeds.size(-1))
             similarity_matrix = F.cosine_similarity(query_embeds_flat.unsqueeze(1), self.CLIPtextFeatureProjector(self.clip_text_feature.unsqueeze(0)), dim=-1)
             similarity_matrix = similarity_matrix.reshape(query_embeds.size(0), query_embeds.size(1), -1)
             
-            # last_similarity_matrix = similarity_matrix[-1]  # shape = (query_embeds.size(1), dim)
-
-            # # 获取每行的 top 5 值及其对应的索引
-            # top5_values, top5_indices = torch.topk(last_similarity_matrix, k=5, dim=-1)
-
-            # # 打印结果
-            # for i, (values, indices) in enumerate(zip(top5_values, top5_indices)):
-            #     print(f"Query {i}:")
-            #     print(f"Top 5 similarities: {values.tolist()}")
-            #     print(f"Indices: {indices.tolist()}")
             logits = torch.full((query_embeds.size(0), query_embeds.size(1), 117), -1.0, device=query_embeds.device)
             concatenated_object_types = torch.cat(object_types, dim=0)
             for i, object_id in enumerate(concatenated_object_types.tolist()):
@@ -986,29 +991,9 @@ class PViC_CLIP(nn.Module):
 
             logit_scale = self.logit_scale.exp()
             logits = logits * logit_scale
-            # print("logits shape: ", logits.shape)
-            # selected_logits = logits[1, 0, :]
-            # selected_probs = torch.sigmoid(selected_logits)
-            # import matplotlib.pyplot as plt
-
-            # selected_probs_np = selected_probs.cpu().numpy()
-
-            # plt.figure(figsize=(8, 6))
-            # plt.hist(selected_probs_np, bins=50, color='blue', alpha=0.7)
-            # plt.xlabel("Sigmoid Probability")
-            # plt.ylabel("Frequency")
-            # plt.title("Distribution of Sigmoid Probabilities for [1, 0, :]")
-            # plt.grid(True)
-
-            # save_path = "sigmoid_distribution.png"
-            # plt.savefig(save_path, dpi=300, bbox_inches='tight')  # 高分辨率保存
-            # print(f"Figure saved to {save_path}")
-
-            # plt.close()
 
         else:
             logits = self.binary_classifier(query_embeds)
-            # print("logits.shape: ", logits.shape)
 
         if self.training:
             labels = associate_with_ground_truth(

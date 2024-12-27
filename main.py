@@ -23,6 +23,7 @@ from pvic import build_detector
 from utils import custom_collate, CustomisedDLE, DataFactory, DataFactory_CLIP
 from configs import base_detector_args, advanced_detector_args
 import ModifiedCLIP as clip
+import time
 
 warnings.filterwarnings("ignore")
 
@@ -177,6 +178,7 @@ if __name__ == '__main__':
     parser.add_argument('--CLIP_decoder', action='store_true', help='use CLIP feature in decoder stage')
     parser.add_argument('--clip4hoi_decoder', action='store_true', help='use clip4hoi decoder')
     parser.add_argument('--CLIP_path', type=str)
+    parser.add_argument('--CLIP_query', action='store_true', help='use CLIP bbox feature and fusion with detr queries')
     parser.add_argument('--kv-src', default='C5', type=str, choices=['C5', 'C4', 'C3'])
     parser.add_argument('--repr-dim', default=384, type=int)
     parser.add_argument('--triplet-enc-layers', default=1, type=int)
@@ -189,7 +191,8 @@ if __name__ == '__main__':
     parser.add_argument('--max-instances', default=15, type=int)
 
     parser.add_argument('--resume', default='', help='Resume from a model')
-    parser.add_argument('--use-wandb', default=False, action='store_true')
+    parser.add_argument('--use-wandb', default=True, action='store_true')
+    parser.add_argument('--wandb_run_name', type=str, help='run name of wandb')
 
     parser.add_argument('--port', default='1234', type=str)
     parser.add_argument('--seed', default=140, type=int)
@@ -210,5 +213,7 @@ if __name__ == '__main__':
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = args.port
     # os.environ["MASTER_PORT"] = "12345"
-
+    start_time = time.time()
     mp.spawn(main, nprocs=args.world_size, args=(args,))
+    end_time = time.time()
+    print(f"Total main time: {end_time - start_time:.2f} seconds.")
