@@ -13,6 +13,8 @@ __pycache__/
 # logs
 wandb/
 
+outputs/
+
 # Distribution / packaging
 .Python
 build/

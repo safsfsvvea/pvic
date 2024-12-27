@@ -142,7 +142,8 @@ class DataFactory(Dataset):
                 anno_file=os.path.join(data_root, f"instances_{partition}.json"),
                 target_transform=pocket.ops.ToTensor(input_format='dict')
             )
-            partition = 'test2015'
+            if self.extract_feature:
+                partition = 'test2015'
         else:
             assert partition in ['train', 'val', 'trainval', 'test'], \
                 "Unknown V-COCO partition " + partition
