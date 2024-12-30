@@ -48,6 +48,51 @@ from ModifiedCLIP import clip
 from collections import defaultdict
 import numpy as np
 
+class MultiBranchFusion(nn.Module):
+    """
+    Multi-branch fusion module
+
+    Parameters:
+    -----------
+    appearance_size: int
+        Size of the appearance features
+    spatial_size: int
+        Size of the spatial features
+    hidden_state_size: int
+        Size of the intermediate representations
+    cardinality: int
+        The number of homogeneous branches
+    """
+    def __init__(self,
+        appearance_size: int, spatial_size: int,
+        hidden_state_size: int, cardinality: int
+    ) -> None:
+        super().__init__()
+        self.cardinality = cardinality
+
+        sub_repr_size = int(hidden_state_size / cardinality)
+        assert sub_repr_size * cardinality == hidden_state_size, \
+            "The given representation size should be divisible by cardinality"
+
+        self.fc_1 = nn.ModuleList([
+            nn.Linear(appearance_size, sub_repr_size)
+            for _ in range(cardinality)
+        ])
+        self.fc_2 = nn.ModuleList([
+            nn.Linear(spatial_size, sub_repr_size)
+            for _ in range(cardinality)
+        ])
+        self.fc_3 = nn.ModuleList([
+            nn.Linear(sub_repr_size, hidden_state_size)
+            for _ in range(cardinality)
+        ])
+    def forward(self, appearance: Tensor, spatial: Tensor) -> Tensor:
+        return F.relu(torch.stack([
+            fc_3(F.relu(fc_1(appearance) * fc_2(spatial)))
+            for fc_1, fc_2, fc_3
+            in zip(self.fc_1, self.fc_2, self.fc_3)
+        ]).sum(dim=0))
+
 class MultiModalFusion(nn.Module):
     def __init__(self, fst_mod_size, scd_mod_size, repr_size):
         super().__init__()
@@ -657,7 +702,13 @@ class PViC_CLIP(nn.Module):
             self.binary_classifier = nn.Linear(768, num_verbs)
 
         if self.CLIP_query:
-            self.mmf = MultiModalFusion(256, 512, 256)
+            # self.mmf = MultiModalFusion(256, 512, 256)
+            self.mbf = MultiBranchFusion(
+                appearance_size=256,  
+                spatial_size=512,
+                hidden_state_size=256,
+                cardinality=4
+)
         
         self.repr_size = repr_size
         self.human_idx = human_idx
@@ -900,24 +951,58 @@ class PViC_CLIP(nn.Module):
         )
         boxes = [r['boxes'] for r in region_props]
         if self.CLIP_query:
+            # def check_tensor(tensor, name):
+            #     if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+            #         print(f"[Debug] {name} contains invalid values:")
+            #         print(f"  - NaN count: {torch.isnan(tensor).sum().item()}")
+            #         print(f"  - Inf count: {torch.isinf(tensor).sum().item()}")
+            #         print(f"  - Min: {tensor.min().item() if not torch.isnan(tensor).any() else 'NaN'}")
+            #         print(f"  - Max: {tensor.max().item() if not torch.isnan(tensor).any() else 'NaN'}")
+            #         raise ValueError(f"{name} contains invalid values (NaN or Inf).")
+            # def debug_model_params(model, name="model"):
+            #     for param_name, param in model.named_parameters():
+            #         nan_mask = torch.isnan(param)
+            #         inf_mask = torch.isinf(param)
+            #         if nan_mask.any() or inf_mask.any():
+            #             print(f"[Debug] {name} parameter {param_name}:")
+            #             print(f"  NaN count: {nan_mask.sum().item()}")
+            #             print(f"  Inf count: {inf_mask.sum().item()}")
+            #             if nan_mask.any():
+            #                 print(f"  NaN indices: {torch.nonzero(nan_mask, as_tuple=True)}")
+            #                 print(f"  NaN values: {param[nan_mask]}")
+            #             if inf_mask.any():
+            #                 print(f"  Inf indices: {torch.nonzero(inf_mask, as_tuple=True)}")
+            #                 print(f"  Inf values: {param[inf_mask]}")
             boxes_lengths = [r['boxes'].shape[0] for r in region_props]
-            # print("boxes: ", boxes)
             clip_input_query = roi_align(nest_tensor.tensors, boxes, (224, 224))
+            # check_tensor(clip_input_query, "clip_input_query")
+            
             clip_transforms = T.Compose([
                 T.Normalize(mean=[-m / s for m, s in zip([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])],
                             std=[1 / s for s in [0.229, 0.224, 0.225]]),
                 T.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))
             ])
             clip_input_query = clip_transforms(clip_input_query)
+            # check_tensor(clip_input_query, "clip_input_query (normalized)")
+            
             with torch.no_grad():
                 clip_cls_query, _ = self.clip_model.encode_image(clip_input_query)
+            # check_tensor(clip_cls_query, "clip_cls_query")
+            
             hidden_states_list = [r['hidden_states'] for r in region_props]
             merged_hidden_states = torch.cat(hidden_states_list, dim=0)
+            # check_tensor(merged_hidden_states, "merged_hidden_states")
+            
             clip_cls_query = clip_cls_query.to(merged_hidden_states.dtype)
-            fused_hidden_states = self.mmf(merged_hidden_states, clip_cls_query)
+            # fused_hidden_states = self.mmf(merged_hidden_states, clip_cls_query)
+            fused_hidden_states = self.mbf(merged_hidden_states, clip_cls_query)
+            # debug_model_params(self.mmf, "mmf")
+            # check_tensor(fused_hidden_states, "fused_hidden_states")
+            
             split_hidden_states = torch.split(fused_hidden_states, boxes_lengths)
             for i, r in enumerate(region_props):
                 r['hidden_states'] = split_hidden_states[i]    
+                # check_tensor(r['hidden_states'], f"region_props[{i}] hidden_states")
         # Produce human-object pairs.
         if self.CLIP_encoder:
             (
@@ -939,7 +1024,7 @@ class PViC_CLIP(nn.Module):
         kv_p_m = mask.reshape(-1, 1, h * w)
         k_pos = self.kv_pe(NestedTensor(memory, mask)).permute(0, 2, 3, 1).reshape(b, h * w, 1, c)
         
-        if self.CLIP_encoder or self.CLIP_decoder:
+        if self.CLIP_decoder:
             B, L, C = clip_visual.shape
             mask_clip = torch.zeros(B, 1, L, dtype=torch.bool, device=images[0].device)
             k_pos_clip = self.kv_pe(NestedTensor(clip_visual, mask_clip)).permute(0, 2, 3, 1).reshape(B, L, 1, C)
