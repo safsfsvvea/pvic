@@ -139,7 +139,7 @@ dmypy.json
 
 
 *.png
-
+*.csv
 
 scripts/
 

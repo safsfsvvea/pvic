@@ -58,7 +58,7 @@ def main(rank, args):
             data_root=args.data_root, args=args
         )
     else:
-        if args.CLIP_query: 
+        if args.CLIP_query or args.CLIP_query_replace: 
             device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
             args.clip_model, args.clip_preprocess = clip.load(args.CLIP_path, device=device)
             for param in args.clip_model.parameters():
@@ -186,6 +186,8 @@ if __name__ == '__main__':
     parser.add_argument('--clip4hoi_decoder', action='store_true', help='use clip4hoi decoder')
     parser.add_argument('--CLIP_path', default='checkpoints/clip/ViT-B-32.pt', type=str)
     parser.add_argument('--CLIP_query', action='store_true', help='use CLIP bbox feature and fusion with detr queries')
+    parser.add_argument('--fused_before', action='store_true', help='use fused detr queries and clip features in compute_box_pe')
+    parser.add_argument('--CLIP_query_replace', action='store_true', help='use CLIP bbox feature data augmentation and fusion with detr queries')
     parser.add_argument('--kv-src', default='C5', type=str, choices=['C5', 'C4', 'C3'])
     parser.add_argument('--repr-dim', default=384, type=int)
     parser.add_argument('--triplet-enc-layers', default=1, type=int)
@@ -199,6 +201,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--resume', default='', help='Resume from a model')
     parser.add_argument('--use-wandb', default=True, action='store_true')
+    parser.add_argument('--wandb_run_name', type=str)
 
     parser.add_argument('--port', default='1234', type=str)
     parser.add_argument('--seed', default=140, type=int)

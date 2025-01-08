@@ -136,6 +136,21 @@ def associate_with_ground_truth_replace(boxes, paired_inds, targets, num_classes
         labels.append(is_match)
     return labels
 
+def associate_with_ground_truth_replace_clip(bx, p_inds, target, num_classes, thresh=0.5):
+    is_match = torch.zeros(len(p_inds), num_classes, device=bx.device)
+
+    bx_h, bx_o = bx[p_inds].unbind(1)
+    gt_bx_h = recover_boxes(target["boxes_h"], target["size"])
+    gt_bx_o = recover_boxes(target["boxes_o"], target["size"])
+
+    x, y = torch.nonzero(torch.min(
+        box_ops.box_iou(bx_h, gt_bx_h),
+        box_ops.box_iou(bx_o, gt_bx_o)
+    ) >= thresh).unbind(1)
+    is_match[x, target["labels"][y]] = 1
+
+    return is_match
+
 def recover_boxes(boxes, size):
     boxes = box_cxcywh_to_xyxy(boxes)
     h, w = size
