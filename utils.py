@@ -33,13 +33,17 @@ from pocket.utils import DetectionAPMeter, BoxPairAssociation
 from ops import recover_boxes
 from detr.datasets import transforms as T
 import ModifiedCLIP as clip
+from PIL import Image
+
 def custom_collate(batch):
     images = []
     targets = []
+    # image_PIL = []
     for im, tar in batch:
         images.append(im)
         targets.append(tar)
-    return images, targets
+        # image_PIL.append(im_PIL)
+    return images, targets # image_PIL
 
 class DataFactory_CLIP(Dataset):
     def __init__(self, name, partition, data_root, args):
@@ -178,6 +182,19 @@ class DataFactory(Dataset):
                     ])
                 ), normalize,
         ])
+        # self.transforms = [T.Compose([
+        #     T.RandomHorizontalFlip(),
+        #     T.ColorJitter(.4, .4, .4),
+        #     T.RandomSelect(
+        #         T.RandomResize(scales, max_size=1333),
+        #         T.Compose([
+        #             T.RandomResize([400, 500, 600]),
+        #             T.RandomSizeCrop(384, 600),
+        #             T.RandomResize(scales, max_size=1333),
+        #         ]))]
+        #     ),
+        #     normalize
+        #     ]
         else:
             self.transforms = T.Compose([
                 T.RandomResize([800], max_size=1333),
@@ -189,9 +206,14 @@ class DataFactory(Dataset):
     def __len__(self):
         return len(self.dataset)
 
+    def resize_image_PIL(self, image_PIL, resized_size):
+        """Resize image_PIL to match resized_size."""
+        return image_PIL.resize(resized_size, resample=Image.BILINEAR)
+
     def __getitem__(self, i):
         image, target = self.dataset[i]
         # print("image: ", image)
+        # image_PIL = image
         # print("target: ", target)
         if self.name == 'hicodet':
             target['labels'] = target['verb']
@@ -204,8 +226,12 @@ class DataFactory(Dataset):
             target['object'] = target.pop('objects')
 
         image, target = self.transforms(image, target)
+        # image_0, target_0 = self.transforms[0](image, target)
+        # image, target = self.transforms[1](image_0, target_0)
+        # resized_size = (image.shape[2], image.shape[1])  # (width, height)
+        # image_PIL = self.resize_image_PIL(image_PIL, resized_size)
 
-        return image, target
+        return image, target # image_0 # image_PIL
 
 class CacheTemplate(defaultdict):
     """A template for VCOCO cached results """

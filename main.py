@@ -97,6 +97,12 @@ def main(rank, args):
         object_to_target = list(train_loader.dataset.dataset.object_to_action.values())
         args.num_verbs = 24
     
+    if args.replace_rare:
+        args.rare = test_loader.dataset.dataset.rare
+        args.object_n_verb_to_interaction = test_loader.dataset.dataset.object_n_verb_to_interaction
+        args.object_n_verb_to_interaction = [
+            [x if x is not None else -1 for x in row] for row in args.object_n_verb_to_interaction
+        ]
     model = build_detector(args, object_to_target)
 
     if os.path.exists(args.resume):
@@ -183,11 +189,8 @@ if __name__ == '__main__':
     parser.add_argument('--CLIP_text', action='store_true', help='use CLIP text feature')
     parser.add_argument('--CLIP_encoder', action='store_true', help='use CLIP feature in encoder stage')
     parser.add_argument('--CLIP_decoder', action='store_true', help='use CLIP feature in decoder stage')
-    parser.add_argument('--clip4hoi_decoder', action='store_true', help='use clip4hoi decoder')
     parser.add_argument('--CLIP_path', default='checkpoints/clip/ViT-B-32.pt', type=str)
     parser.add_argument('--CLIP_query', action='store_true', help='use CLIP bbox feature and fusion with detr queries')
-    parser.add_argument('--fused_before', action='store_true', help='use fused detr queries and clip features in compute_box_pe')
-    parser.add_argument('--CLIP_query_replace', action='store_true', help='use CLIP bbox feature data augmentation and fusion with detr queries')
     parser.add_argument('--kv-src', default='C5', type=str, choices=['C5', 'C4', 'C3'])
     parser.add_argument('--repr-dim', default=384, type=int)
     parser.add_argument('--triplet-enc-layers', default=1, type=int)
@@ -210,6 +213,7 @@ if __name__ == '__main__':
     parser.add_argument('--cache', action='store_true')
     parser.add_argument('--sanity', action='store_true')
     parser.add_argument('--extract_feature', action='store_true', help='extract object feature')
+    parser.add_argument('--replace_rare', action='store_true', help='replace rare HOI object feature')
     parser.add_argument('--object_feature_replace_prob', default=0, type=float, help='probability of replacing object query')
     parser.add_argument('--object_feature_replace_thresh', default=.9, type=float, help='score threshold of replacing object query')
     parser.add_argument('--same_object_verb', action='store_true', help='replace object query when object and verb category are exactly the same')

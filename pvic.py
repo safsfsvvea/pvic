@@ -246,7 +246,10 @@ class HumanObjectMatcher_replace(nn.Module):
 
         paired_indices = []
         for i, rp in enumerate(region_props):
-            boxes, scores, labels, embeds = rp.values()
+            if len(rp.values()) > 4:
+                boxes, scores, labels, embeds, _ = rp.values()
+            else:
+                boxes, scores, labels, embeds = rp.values()
             nh = self.check_human_instances(labels)
             n = len(boxes)
             # Enumerate instance pairs
@@ -434,7 +437,6 @@ class HumanObjectMatcher(nn.Module):
         )
         self.encoder = TransformerEncoder(num_layers=2, dropout=dropout)
         self.mmf = MultiModalFusion(512, repr_size, repr_size)
-        self.fused_before = args.fused_before
 
     def check_human_instances(self, labels):
         is_human = labels == self.human_idx
@@ -472,9 +474,8 @@ class HumanObjectMatcher(nn.Module):
         object_types = []
         positional_embeds = []
         for i, rp in enumerate(region_props):
-            fused_embeds = None
             if len(rp.values()) > 4:
-                boxes, scores, labels, embeds, fused_embeds = rp.values()
+                boxes, scores, labels, embeds, _ = rp.values()
             else:
                 boxes, scores, labels, embeds = rp.values()
             nh = self.check_human_instances(labels)
@@ -501,11 +502,8 @@ class HumanObjectMatcher(nn.Module):
             pairwise_spatial = self.spatial_head(pairwise_spatial)
             pairwise_spatial_reshaped = pairwise_spatial.reshape(n, n, -1)
 
-            if fused_embeds is not None and self.fused_before:
-                embeds = fused_embeds
             box_pe, c_pe = self.compute_box_pe(boxes, embeds, image_sizes[i])
-            if fused_embeds is not None:
-                embeds = fused_embeds
+            
             embeds, _ = self.encoder(embeds.unsqueeze(1), box_pe.unsqueeze(1))
             # print("embeds.shape: ", embeds.shape)
             embeds = embeds.squeeze(1)
@@ -875,8 +873,7 @@ class PViC_replace(nn.Module):
 
         self.detector = detector[0]
         self.CLIP_query = args.CLIP_query
-        self.CLIP_query_replace = args.CLIP_query_replace
-        if self.CLIP_query or self.CLIP_query_replace:
+        if self.CLIP_query:
             self.clip_model = args.clip_model
             # self.mmf = MultiModalFusion(256, 512, 256)
             self.mbf = MultiBranchFusion(
@@ -903,7 +900,15 @@ class PViC_replace(nn.Module):
         self.postprocessor = postprocessor
 
         self.ho_matcher = ho_matcher
-        self.ho_matcher_replace = ho_matcher_replace
+        
+        self.replace_rare = args.replace_rare
+        if self.replace_rare:
+            self.ho_matcher_replace = ho_matcher_replace
+            self.rare = torch.tensor(args.rare, dtype=torch.long)
+            # print("self.rare: ", self.rare, flush=True)
+            # print("args.object_n_verb_to_interaction: ", args.object_n_verb_to_interaction, flush=True)
+            self.object_n_verb_to_interaction = torch.tensor(args.object_n_verb_to_interaction, dtype=torch.long)
+            # print("self.object_n_verb_to_interaction: ", self.object_n_verb_to_interaction, flush=True)
         
         self.feature_head = feature_head
         self.kv_pe = PositionEmbeddingSine(128, 20, normalize=True)
@@ -957,7 +962,8 @@ class PViC_replace(nn.Module):
             dict: A dictionary mapping class labels to their feature arrays.
         """
         feature_memory = {}
-        for label in range(1, num_classes):
+        # for label in range(0, num_classes):
+        for label in range(1, 6):
             feature_file = os.path.join(feature_dir, "features",  f"{label}_features.npy")
             if os.path.exists(feature_file):
                 feature_memory[label] = np.load(feature_file)
@@ -1070,7 +1076,52 @@ class PViC_replace(nn.Module):
                             chosen_feature = features_for_pair[0]
                             region_props[i]["hidden_states"][object_idx] = torch.tensor(chosen_feature)
         return region_props
-    
+    def replace_clip_rare_object_features_with_probability(self, region_props, paired_inds, labels):
+        for i, props in enumerate(region_props):
+            object_to_pairs = {}
+            hidden_states = props['clip_features']
+            scores = props["scores"]  # 形状: (N,)
+            valid_object_mask = scores > self.object_feature_replace_thresh
+            valid_object_indices = torch.nonzero(valid_object_mask).squeeze(1).tolist()  # 筛选出的 object_idx 列表
+
+            # 构建 object_to_pairs 映射，仅考虑有效的 object_idx
+            pairs = paired_inds[i]
+            for pair_idx, (human_idx, object_idx) in enumerate(pairs):
+                if object_idx in valid_object_indices:
+                    object_to_pairs.setdefault(object_idx, []).append(pair_idx)
+
+            # 将所有相关信息转换为张量进行批量操作
+            for object_idx, pair_indices in object_to_pairs.items():
+                # 收集所有 pair 的 verb labels
+                pair_labels = labels[i][pair_indices]  # 提取当前 object 的所有 pair 的 verb labels (形状: [num_pairs, 117])
+                verb_indices_per_pair = pair_labels.nonzero(as_tuple=False)  # (num_nonzero, 2), 每行表示 [pair_idx, verb_idx]
+                if verb_indices_per_pair.numel() == 0:  # 如果没有任何非零 verb，跳过
+                    continue
+
+                # 将 pair_indices 和对应的 verb indices 映射到 HOI index
+                pair_idx_map = verb_indices_per_pair[:, 0]  # pair_indices 中的索引
+                verb_indices = verb_indices_per_pair[:, 1]  # 具体的 verb indices
+                object_label = int(props["labels"][object_idx].item())
+                
+                # 判断 HOI index 是否在 self.rare 中
+                hoi_indices = self.object_n_verb_to_interaction[object_label, verb_indices]
+                # 手动实现 isin 的等价功能
+                rare_mask = torch.tensor([hoi_index in self.rare for hoi_index in hoi_indices], dtype=torch.bool)
+
+
+                if rare_mask.any():  # 如果有任何一个 HOI index 是稀有的，进行特征替换
+                    if torch.rand(1).item() < self.object_feature_replace_prob:  # 替换概率
+                        if (
+                            object_label in self.feature_memory
+                            and self.feature_memory[object_label].shape[0] > 0
+                        ):
+                            random_index = np.random.randint(0, self.feature_memory[object_label].shape[0])
+                            random_feature = self.feature_memory[object_label][random_index]
+                            hidden_states[object_idx] = torch.tensor(random_feature, dtype=hidden_states.dtype, device=hidden_states.device)
+
+        props['clip_features'] = hidden_states
+        return region_props
+
     def freeze_detector(self):
         for p in self.detector.parameters():
             p.requires_grad = False
@@ -1278,24 +1329,7 @@ class PViC_replace(nn.Module):
             max_instances=self.max_instances
         )
         boxes = [r['boxes'] for r in region_props]
-        if self.CLIP_query_replace:
-            boxes_lengths = [r['boxes'].shape[0] for r in region_props]
-            # print("boxes: ", boxes)
-            clip_input = roi_align(nest_tensor.tensors, boxes, (224, 224))
-            # print("clip_input.shape: ", clip_input.shape)
-            clip_transforms = T.Compose([
-                T.Normalize(mean=[-m / s for m, s in zip([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])],
-                            std=[1 / s for s in [0.229, 0.224, 0.225]]),
-                T.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))
-            ])
-            clip_input = clip_transforms(clip_input)
-            with torch.no_grad():
-                clip_cls, clip_visual_ori = self.clip_model.encode_image(clip_input)
-            clip_cls = clip_cls.to(region_props[0]['hidden_states'].dtype)
-            split_clip_cls = torch.split(clip_cls, boxes_lengths)
-            for i, r in enumerate(region_props):
-                r['clip_features'] = split_clip_cls[i]
-
+            
         if self.CLIP_query:
             boxes_lengths = [r['boxes'].shape[0] for r in region_props]
             # print("boxes: ", boxes)
@@ -1313,54 +1347,40 @@ class PViC_replace(nn.Module):
             merged_hidden_states = torch.cat(hidden_states_list, dim=0)
             clip_cls = clip_cls.to(merged_hidden_states.dtype)
             # fused_hidden_states = self.mmf(merged_hidden_states, clip_cls)
-            fused_hidden_states = self.mbf(merged_hidden_states, clip_cls)
-            split_hidden_states = torch.split(fused_hidden_states, boxes_lengths)
-            for i, r in enumerate(region_props):
-                r['hidden_states'] = split_hidden_states[i]
-            # print("clip_cls.shape: ", clip_cls.shape)
-            
-        # print("region_props[0]['labels']: ", region_props[0]['labels'])
-        # print("region_props[0]['scores']: ", region_props[0]['scores'])
-        # print("region_props[1]['labels']: ", region_props[1]['labels'])
-        # print("region_props[1]['scores']: ", region_props[1]['scores'])
-        # print("region_props[0]['hidden_states'].shape: ", region_props[0]['hidden_states'].shape)
-        # region_props[0]['hidden_states'][3] = region_props[1]['hidden_states'][3]
-        # region_props = region_props[:1]
-        # print("self.object_feature_replace_prob: ", self.object_feature_replace_prob, flush=True)
-        if self.object_feature_replace_prob > 0 and self.training:
-            # print("self.object_feature_replace_prob: ", self.object_feature_replace_prob, flush=True)
-            if self.CLIP_query_replace:
-                    if not self.same_object_verb:
-                        region_props = self.replace_clip_features_with_probability(region_props)
-                        
-            elif self.ho_matcher_replace is not None:
-                paired_inds = None
-                labels = None
-                paired_inds = self.ho_matcher_replace(region_props, image_sizes)
-                labels = associate_with_ground_truth_replace(
-                        boxes, paired_inds, targets, self.num_verbs
-                    )
-                region_props = self.replace_object_verb_features_with_probability(region_props, paired_inds, labels)
+            if self.same_object_verb:
+                split_clip_cls = torch.split(clip_cls, boxes_lengths)
+                for i, r in enumerate(region_props):
+                    r['clip_features'] = split_clip_cls[i]
             else:
-                region_props = self.replace_features_with_probability(region_props)
-        # boxes = [r['boxes'] for r in region_props]
+                if self.object_feature_replace_prob > 0 and self.training:
+                    split_clip_cls = torch.split(clip_cls, boxes_lengths)
+                    for i, r in enumerate(region_props):
+                        r['clip_features'] = split_clip_cls[i]
+                    if self.replace_rare:
+                        paired_inds = None
+                        labels = None
+                        paired_inds = self.ho_matcher_replace(region_props, image_sizes)
+                        labels = associate_with_ground_truth_replace(
+                                boxes, paired_inds, targets, self.num_verbs
+                            )
+                        region_props = self.replace_clip_rare_object_features_with_probability(region_props, paired_inds, labels)
+                    else:
+                        region_props = self.replace_clip_features_with_probability(region_props)
+                    clip_features_list = [r['clip_features'] for r in region_props]
+                    clip_cls = torch.cat(clip_features_list, dim=0)
+                fused_hidden_states = self.mbf(merged_hidden_states, clip_cls)
+                split_hidden_states = torch.split(fused_hidden_states, boxes_lengths)
+                for i, r in enumerate(region_props):
+                    r['hidden_states'] = split_hidden_states[i]
+            
         # Produce human-object pairs.
-        if self.CLIP_query_replace and self.same_object_verb:
+        if self.CLIP_query and self.same_object_verb:
             (
                 ho_queries,
                 paired_inds, prior_scores,
                 object_types, positional_embeds
             ) = self.ho_matcher(region_props, image_sizes, targets, self.feature_memory, self.object_feature_replace_prob, self.object_feature_replace_thresh)
         else:
-            if self.CLIP_query_replace:
-                hidden_states_list = [r['hidden_states'] for r in region_props]
-                merged_hidden_states = torch.cat(hidden_states_list, dim=0)
-                clip_features_list = [r['clip_features'] for r in region_props]
-                clip_features_merged = torch.cat(clip_features_list, dim=0)
-                fused_hidden_states = self.mbf(merged_hidden_states, clip_features_merged)
-                split_hidden_states = torch.split(fused_hidden_states, boxes_lengths)
-                for i, r in enumerate(region_props):
-                    r['clip_features'] = split_hidden_states[i]
             (
                 ho_queries,
                 paired_inds, prior_scores,
@@ -1645,7 +1665,7 @@ class PViC_CLIP(nn.Module):
         box_score_thresh: float = .05,
         min_instances: int = 3,
         max_instances: int = 15,
-        raw_lambda: float = 2.8, clip4hoi_decoder=None, args = None
+        raw_lambda: float = 2.8, args = None
     ) -> None:
         super().__init__()
 
@@ -1660,7 +1680,6 @@ class PViC_CLIP(nn.Module):
         self.feature_head = feature_head
         self.kv_pe = PositionEmbeddingSine(128, 20, normalize=True)
         self.decoder = triplet_decoder
-        self.clip4hoi_decoder = clip4hoi_decoder
         self.clip_model = clip_model
         self.CLIP_text = args.CLIP_text
         self.CLIP_encoder = args.CLIP_encoder
@@ -1674,10 +1693,8 @@ class PViC_CLIP(nn.Module):
             nn.Linear(512, 384)
         )
         self.qeury_to_clip_projector = nn.Linear(384, 768)
-        if self.clip4hoi_decoder is None:
-            self.binary_classifier = nn.Linear(repr_size, num_verbs)
-        else:
-            self.binary_classifier = nn.Linear(768, num_verbs)
+        
+        self.binary_classifier = nn.Linear(repr_size, num_verbs)
 
         self.repr_size = repr_size
         self.human_idx = human_idx
@@ -1975,17 +1992,6 @@ class PViC_CLIP(nn.Module):
                     q_pos=positional_embeds[i],     # centre: (n, 1, 2*kv_dim), box: (n, 1, 4*kv_dim)
                     k_pos=k_pos[i]                  # (hw, 1, kv_dim)
                 ).squeeze(dim=2))
-        if self.clip4hoi_decoder is not None:
-            final_query_embeds = []
-            for i, (ho_q, clip_vis) in enumerate(zip(query_embeds, clip_visual_ori)):
-                final_query_embeds.append(self.clip4hoi_decoder(
-                    self.qeury_to_clip_projector(ho_q[-1]).unsqueeze(1),
-                    clip_vis[1:].unsqueeze(1),
-                    clip_vis[0:1].unsqueeze(1)
-                ).squeeze(dim=2))
-            query_embeds = final_query_embeds
-            # final_query_embeds = torch.cat(final_query_embeds, dim=1)
-            # print("final_query_embeds shape: ", final_query_embeds.shape)
         # Concatenate queries from all images in the same batch.
         query_embeds = torch.cat(query_embeds, dim=1)   # (ndec, \sigma{n}, q_dim)
         # print("query_embeds shape: ", query_embeds.shape)
@@ -2077,11 +2083,6 @@ def build_detector(args, obj_to_verb):
             args=args       
         )
         return model
-    ho_matcher_replace = None
-    if args.same_object_verb:
-            ho_matcher_replace = HumanObjectMatcher_replace(
-                num_verbs=117,
-            )
     if args.CLIP_encoder:
         ho_matcher = HumanObjectMatcher_CLIP(
             repr_size=args.repr_dim,
@@ -2090,7 +2091,7 @@ def build_detector(args, obj_to_verb):
             dropout=args.dropout
         )
     else:
-        if args.CLIP_query_replace and args.same_object_verb:
+        if args.CLIP_query and args.same_object_verb:
             ho_matcher = HumanObjectMatcher_CLIP_replace(
                 repr_size=args.repr_dim,
                 num_verbs=args.num_verbs,
@@ -2105,6 +2106,11 @@ def build_detector(args, obj_to_verb):
                 dropout=args.dropout,
                 args=args
             )
+    ho_matcher_replace = None
+    if args.replace_rare:
+        ho_matcher_replace = HumanObjectMatcher_replace(
+            num_verbs=117,
+        )
     if args.CLIP_decoder:
         decoder_layer = TransformerDecoderLayerCLIP(
             q_dim=args.repr_dim, kv_dim=args.hidden_dim,
@@ -2125,10 +2131,6 @@ def build_detector(args, obj_to_verb):
             decoder_layer=decoder_layer,
             num_layers=args.triplet_dec_layers
         )
-    if args.clip4hoi_decoder:
-        clip4hoi_decoder = Transformer_clip4hoi()
-    else:
-        clip4hoi_decoder = None
     return_layer = {"C5": -1, "C4": -2, "C3": -3}[args.kv_src]
     if isinstance(detr.backbone.num_channels, list):
         num_channels = detr.backbone.num_channels[-1]
@@ -2152,7 +2154,6 @@ def build_detector(args, obj_to_verb):
             min_instances=args.min_instances,
             max_instances=args.max_instances,
             raw_lambda=args.raw_lambda,
-            clip4hoi_decoder=clip4hoi_decoder,
             args=args
         )
     else:

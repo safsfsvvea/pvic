@@ -14,6 +14,77 @@ import json
 from tqdm import tqdm
 import ModifiedCLIP as clip
 warnings.filterwarnings("ignore")
+from PIL import ImageDraw
+import time
+
+def extract_and_save_features_test(args, outputs, output_dir, json_output, images_PIL, global_counter):
+    """
+    从 outputs 提取特征并保存到指定的路径，并将被选择的 object 及其 bbox 可视化到对应的图像上。
+    使用全局计数器避免文件名冲突。
+    """
+    vis_dir = os.path.join(output_dir, "visualizations")
+    os.makedirs(vis_dir, exist_ok=True)
+
+    for batch_idx, (props, image_PIL) in enumerate(zip(outputs, images_PIL)):
+        labels = props["labels"]
+        scores = props["scores"]
+        bboxes = props["boxes"]  # 假设 bbox 是 (N, 4)，格式为 [x1, y1, x2, y2]
+        hidden_states = props["hidden_states"]
+
+        # 创建可编辑的 PIL 图片副本
+        draw = ImageDraw.Draw(image_PIL)
+        has_valid_object = False
+
+        for i, (label, score, bbox) in enumerate(zip(labels, scores, bboxes)):
+            label = label.item()
+            score = score.item()
+            feature = hidden_states[i].cpu().numpy()
+            bbox = bbox.cpu().numpy()
+
+            if score > args.object_score_thresh and label in {1, 2, 3, 4, 5}:
+                
+                # 如果当前类别尚未记录到 JSON，进行初始化
+                if label not in json_output:
+                    json_output[label] = {
+                        "class_id": label,
+                        "feature_file": f"{label}_features.npy",
+                        "num_features": 0
+                    }
+
+                feature_file = os.path.join(output_dir, "features", f"{label}_features.npy")
+                if os.path.exists(feature_file):
+                    existing_features = np.load(feature_file)
+                else:
+                    existing_features = np.empty((0, hidden_states.shape[-1]))
+
+                # 如果尚未达到最大特征数，存储特征
+                # if json_output[label]["num_features"] < args.max_object_features:
+                has_valid_object = True
+                all_features = np.vstack([existing_features, feature[np.newaxis, :]])
+                np.save(feature_file, all_features)
+                json_output[label]["num_features"] += 1
+
+                # 可视化：绘制当前 bbox 和类别
+                draw.rectangle(
+                    [bbox[0], bbox[1], bbox[2], bbox[3]], 
+                    outline="red", width=3
+                )
+                draw.text(
+                    (bbox[0], bbox[1] - 10), 
+                    f"Label: {label}, Score: {score:.2f}", 
+                    fill="red"
+                )
+        if has_valid_object:
+            # 保存标注后的图像，文件名包含全局计数器和时间戳
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            image_save_path = os.path.join(vis_dir, f"image_{global_counter:06d}_{timestamp}.jpg")
+            image_PIL.save(image_save_path)
+
+        # 更新全局计数器
+        global_counter += 1
+
+    return global_counter
+
 def extract_and_save_features_verb(args, region_props, paired_inds, labels, output_dir, json_output):
     """
     从 region_props, paired_inds 和 labels 提取特征并保存到指定路径。
@@ -166,7 +237,7 @@ def extract_and_save_features(args, outputs, output_dir, json_output):
             score = score.item()
             feature = hidden_states[i].cpu().numpy()
 
-            if score > args.object_score_thresh and label != 0:
+            if score > args.object_score_thresh:
                 if label not in json_output:
                     json_output[label] = {
                         "class_id": label,
@@ -214,15 +285,20 @@ def main(args):
     features_dir = os.path.join(output_dir, "features")
     os.makedirs(features_dir, exist_ok=True)
     json_output = {}
-    for images, targets in tqdm(test_loader, desc="Processing images", unit="batch"):
+    global_counter = 0
+    for images, targets, images_PIL in tqdm(test_loader, desc="Processing images", unit="batch"):
         with torch.no_grad():
             images = [image.to(device) for image in images]
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+            # print("targets: ", targets)
             region_props, paired_inds, labels = model(images, targets)
             if args.same_object_verb:
                 extract_and_save_features_verb(args, region_props, paired_inds, labels, output_dir, json_output)
             else:
-                extract_and_save_features(args, region_props, output_dir, json_output)
+                # extract_and_save_features(args, region_props, output_dir, json_output)
+                global_counter = extract_and_save_features_test(
+                    args, region_props, output_dir, json_output, images_PIL, global_counter
+                )
     metadata_file = os.path.join(output_dir, "features_metadata.json")
     with open(metadata_file, "w") as f:
         json.dump(json_output, f, indent=4)
@@ -247,7 +323,7 @@ if __name__ == '__main__':
     parser.add_argument('--object-score-thresh', default=0.9, type=float)
     parser.add_argument('--min-instances', default=3, type=int)
     parser.add_argument('--max-instances', default=15, type=int)
-    parser.add_argument('--max-object-features', default=10, type=int)
+    parser.add_argument('--max-object-features', default=100, type=int)
     parser.add_argument('--CLIP_path', default='checkpoints/clip/ViT-B-32.pt', type=str)
     parser.add_argument('--CLIP_query', action='store_true', help='use CLIP bbox feature and fusion with detr queries')
 
